@@ -74,20 +74,20 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
   // Output publishers (RELIABLE for downstream consumers and RViz)
   const auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
   target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
-    "/midtobox/target_pose", reliable_qos);
+    target_pose_topic_, reliable_qos);
   detections_pub_ = this->create_publisher<vision_msgs::msg::Detection3DArray>(
-    "/midtobox/detections", reliable_qos);
+    detections_topic_, reliable_qos);
   locked_pub_ = this->create_publisher<std_msgs::msg::Bool>(
-    "/midtobox/locked", reliable_qos);
+    locked_topic_, reliable_qos);
   markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-    "/midtobox/markers", reliable_qos);
+    markers_topic_, reliable_qos);
 
   if (debug_publish_clouds_) {
     const auto debug_qos = rclcpp::SensorDataQoS().keep_last(2);
     debug_accum_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/midtobox/debug/accumulated_cloud", debug_qos);
+      debug_accum_topic_, debug_qos);
     debug_nonground_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/midtobox/debug/non_ground_cloud", debug_qos);
+      debug_nonground_topic_, debug_qos);
   }
 
   // Sensor subscription QoS: BEST_EFFORT subscribes cleanly to both RELIABLE (livox_ros_driver2)
@@ -131,6 +131,10 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
       input_topic_.c_str(), qos_reliability_.c_str());
   }
 
+  // Enable live parameter tuning via `ros2 param set` after startup declaration completes
+  param_cb_handle_ = this->add_on_set_parameters_callback(
+    std::bind(&MidtoboxDetectorNode::onParametersSet, this, std::placeholders::_1));
+
   RCLCPP_INFO(
     this->get_logger(),
     "Mounting: inverted=%s, xyz=(%.3f, %.3f, %.3f), trim_rpy_deg=(%.2f, %.2f, %.2f) | "
@@ -147,166 +151,528 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
 
 void MidtoboxDetectorNode::declareAndLoadParameters()
 {
-  // IO & frames
-  input_topic_ = this->declare_parameter<std::string>("input_topic", "/livox/lidar");
-  input_format_ = this->declare_parameter<std::string>("input_format", "pointcloud2");
-  qos_reliability_ = this->declare_parameter<std::string>("qos_reliability", "best_effort");
+  // IO, topics & frames (defaults sourced from member initializers / config_types.hpp)
+  input_topic_ = this->declare_parameter<std::string>("input_topic", input_topic_);
+  input_format_ = this->declare_parameter<std::string>("input_format", input_format_);
+  qos_reliability_ = this->declare_parameter<std::string>("qos_reliability", qos_reliability_);
+
+  target_pose_topic_ =
+    this->declare_parameter<std::string>("topics.target_pose", target_pose_topic_);
+  detections_topic_ =
+    this->declare_parameter<std::string>("topics.detections", detections_topic_);
+  locked_topic_ = this->declare_parameter<std::string>("topics.locked", locked_topic_);
+  markers_topic_ = this->declare_parameter<std::string>("topics.markers", markers_topic_);
+  debug_accum_topic_ = this->declare_parameter<std::string>(
+    "topics.debug_accumulated_cloud", debug_accum_topic_);
+  debug_nonground_topic_ = this->declare_parameter<std::string>(
+    "topics.debug_non_ground_cloud", debug_nonground_topic_);
+
   base_frame_ = stripLeadingSlash(
-    this->declare_parameter<std::string>("base_frame", "base_footprint"));
+    this->declare_parameter<std::string>("base_frame", base_frame_));
   lidar_frame_ = stripLeadingSlash(
-    this->declare_parameter<std::string>("lidar_frame", "livox_frame"));
+    this->declare_parameter<std::string>("lidar_frame", lidar_frame_));
   odom_frame_ = stripLeadingSlash(
-    this->declare_parameter<std::string>("odom_frame", "odom"));
+    this->declare_parameter<std::string>("odom_frame", odom_frame_));
   output_frame_ = stripLeadingSlash(
-    this->declare_parameter<std::string>("output_frame", "base_footprint"));
-  publish_static_tf_ = this->declare_parameter<bool>("publish_static_tf", true);
+    this->declare_parameter<std::string>("output_frame", output_frame_));
+  publish_static_tf_ = this->declare_parameter<bool>("publish_static_tf", publish_static_tf_);
 
   // Mounting
-  mounting_cfg_.inverted = this->declare_parameter<bool>("mounting.inverted", true);
-  mounting_cfg_.x = this->declare_parameter<double>("mounting.x", 0.0);
-  mounting_cfg_.y = this->declare_parameter<double>("mounting.y", 0.0);
-  mounting_cfg_.z = this->declare_parameter<double>("mounting.z", 0.70);
-  mounting_cfg_.roll_deg = this->declare_parameter<double>("mounting.roll_deg", 0.0);
-  mounting_cfg_.pitch_deg = this->declare_parameter<double>("mounting.pitch_deg", 0.0);
-  mounting_cfg_.yaw_deg = this->declare_parameter<double>("mounting.yaw_deg", 0.0);
+  mounting_cfg_.inverted =
+    this->declare_parameter<bool>("mounting.inverted", mounting_cfg_.inverted);
+  mounting_cfg_.x = this->declare_parameter<double>("mounting.x", mounting_cfg_.x);
+  mounting_cfg_.y = this->declare_parameter<double>("mounting.y", mounting_cfg_.y);
+  mounting_cfg_.z = this->declare_parameter<double>("mounting.z", mounting_cfg_.z);
+  mounting_cfg_.roll_deg =
+    this->declare_parameter<double>("mounting.roll_deg", mounting_cfg_.roll_deg);
+  mounting_cfg_.pitch_deg =
+    this->declare_parameter<double>("mounting.pitch_deg", mounting_cfg_.pitch_deg);
+  mounting_cfg_.yaw_deg =
+    this->declare_parameter<double>("mounting.yaw_deg", mounting_cfg_.yaw_deg);
   T_base_lidar_ = mounting_cfg_.computeTransform();
 
   // Sliding window
-  window_duration_sec_ = this->declare_parameter<double>("window.duration_sec", 0.25);
-  window_max_frames_ = this->declare_parameter<int>("window.max_frames", 4);
-  odom_tf_max_age_sec_ = this->declare_parameter<double>("window.odom_tf_max_age_sec", 0.15);
-  storage_roi_padding_ = this->declare_parameter<double>("window.storage_roi_padding", 1.0);
+  window_duration_sec_ =
+    this->declare_parameter<double>("window.duration_sec", window_duration_sec_);
+  window_max_frames_ = this->declare_parameter<int>("window.max_frames", window_max_frames_);
+  odom_tf_max_age_sec_ =
+    this->declare_parameter<double>("window.odom_tf_max_age_sec", odom_tf_max_age_sec_);
+  storage_roi_padding_ =
+    this->declare_parameter<double>("window.storage_roi_padding", storage_roi_padding_);
 
   // Pre-filter (Mid-360 tag & range)
-  prefilter_cfg_.min_range = this->declare_parameter<double>("prefilter.min_range", 0.25);
-  prefilter_cfg_.max_range = this->declare_parameter<double>("prefilter.max_range", 6.0);
-  prefilter_cfg_.use_tag_filter = this->declare_parameter<bool>("prefilter.use_tag_filter", true);
-  const int mask_int = this->declare_parameter<int>("prefilter.tag_reject_mask", 63);
+  prefilter_cfg_.min_range =
+    this->declare_parameter<double>("prefilter.min_range", prefilter_cfg_.min_range);
+  prefilter_cfg_.max_range =
+    this->declare_parameter<double>("prefilter.max_range", prefilter_cfg_.max_range);
+  prefilter_cfg_.use_tag_filter =
+    this->declare_parameter<bool>("prefilter.use_tag_filter", prefilter_cfg_.use_tag_filter);
+  const int mask_int = this->declare_parameter<int>(
+    "prefilter.tag_reject_mask", static_cast<int>(prefilter_cfg_.tag_reject_mask));
   prefilter_cfg_.tag_reject_mask = static_cast<uint8_t>(std::clamp(mask_int, 0, 255));
 
   PipelineConfig cfg;
 
   // Ego crop & workspace ROI
-  cfg.crop.ego_enabled = this->declare_parameter<bool>("crop.ego_enabled", true);
-  cfg.crop.ego_min_x = this->declare_parameter<double>("crop.ego_min_x", -0.50);
-  cfg.crop.ego_max_x = this->declare_parameter<double>("crop.ego_max_x", 0.40);
-  cfg.crop.ego_min_y = this->declare_parameter<double>("crop.ego_min_y", -0.45);
-  cfg.crop.ego_max_y = this->declare_parameter<double>("crop.ego_max_y", 0.45);
-  cfg.crop.ego_min_z = this->declare_parameter<double>("crop.ego_min_z", -0.10);
-  cfg.crop.ego_max_z = this->declare_parameter<double>("crop.ego_max_z", 1.10);
-  cfg.crop.roi_min_x = this->declare_parameter<double>("crop.roi_min_x", 0.45);
-  cfg.crop.roi_max_x = this->declare_parameter<double>("crop.roi_max_x", 3.20);
-  cfg.crop.roi_min_y = this->declare_parameter<double>("crop.roi_min_y", -1.20);
-  cfg.crop.roi_max_y = this->declare_parameter<double>("crop.roi_max_y", 1.20);
-  cfg.crop.roi_min_z = this->declare_parameter<double>("crop.roi_min_z", -0.25);
-  cfg.crop.roi_max_z = this->declare_parameter<double>("crop.roi_max_z", 0.90);
-  cfg.crop.voxel_leaf_size = this->declare_parameter<double>("crop.voxel_leaf_size", 0.0);
+  cfg.crop.ego_enabled =
+    this->declare_parameter<bool>("crop.ego_enabled", cfg.crop.ego_enabled);
+  cfg.crop.ego_min_x = this->declare_parameter<double>("crop.ego_min_x", cfg.crop.ego_min_x);
+  cfg.crop.ego_max_x = this->declare_parameter<double>("crop.ego_max_x", cfg.crop.ego_max_x);
+  cfg.crop.ego_min_y = this->declare_parameter<double>("crop.ego_min_y", cfg.crop.ego_min_y);
+  cfg.crop.ego_max_y = this->declare_parameter<double>("crop.ego_max_y", cfg.crop.ego_max_y);
+  cfg.crop.ego_min_z = this->declare_parameter<double>("crop.ego_min_z", cfg.crop.ego_min_z);
+  cfg.crop.ego_max_z = this->declare_parameter<double>("crop.ego_max_z", cfg.crop.ego_max_z);
+  cfg.crop.roi_min_x = this->declare_parameter<double>("crop.roi_min_x", cfg.crop.roi_min_x);
+  cfg.crop.roi_max_x = this->declare_parameter<double>("crop.roi_max_x", cfg.crop.roi_max_x);
+  cfg.crop.roi_min_y = this->declare_parameter<double>("crop.roi_min_y", cfg.crop.roi_min_y);
+  cfg.crop.roi_max_y = this->declare_parameter<double>("crop.roi_max_y", cfg.crop.roi_max_y);
+  cfg.crop.roi_min_z = this->declare_parameter<double>("crop.roi_min_z", cfg.crop.roi_min_z);
+  cfg.crop.roi_max_z = this->declare_parameter<double>("crop.roi_max_z", cfg.crop.roi_max_z);
+  cfg.crop.voxel_leaf_size =
+    this->declare_parameter<double>("crop.voxel_leaf_size", cfg.crop.voxel_leaf_size);
 
   // Ground segmentation
-  cfg.ground.use_ransac = this->declare_parameter<bool>("ground.use_ransac", true);
-  cfg.ground.band_min_z = this->declare_parameter<double>("ground.band_min_z", -0.25);
-  cfg.ground.band_max_z = this->declare_parameter<double>("ground.band_max_z", 0.25);
-  cfg.ground.max_tilt_deg = this->declare_parameter<double>("ground.max_tilt_deg", 8.0);
-  cfg.ground.ransac_dist_thresh =
-    this->declare_parameter<double>("ground.ransac_dist_thresh", 0.025);
-  cfg.ground.ransac_max_iter = this->declare_parameter<int>("ground.ransac_max_iter", 200);
-  cfg.ground.min_inliers = this->declare_parameter<int>("ground.min_inliers", 30);
-  cfg.ground.max_plane_offset = this->declare_parameter<double>("ground.max_plane_offset", 0.20);
-  cfg.ground.nominal_z = this->declare_parameter<double>("ground.nominal_z", 0.0);
-  cfg.ground.clearance_height = this->declare_parameter<double>("ground.clearance_height", 0.045);
-  cfg.ground.level_to_ground = this->declare_parameter<bool>("ground.level_to_ground", true);
+  cfg.ground.use_ransac =
+    this->declare_parameter<bool>("ground.use_ransac", cfg.ground.use_ransac);
+  cfg.ground.band_min_z =
+    this->declare_parameter<double>("ground.band_min_z", cfg.ground.band_min_z);
+  cfg.ground.band_max_z =
+    this->declare_parameter<double>("ground.band_max_z", cfg.ground.band_max_z);
+  cfg.ground.max_tilt_deg =
+    this->declare_parameter<double>("ground.max_tilt_deg", cfg.ground.max_tilt_deg);
+  cfg.ground.ransac_dist_thresh = this->declare_parameter<double>(
+    "ground.ransac_dist_thresh", cfg.ground.ransac_dist_thresh);
+  cfg.ground.ransac_max_iter =
+    this->declare_parameter<int>("ground.ransac_max_iter", cfg.ground.ransac_max_iter);
+  cfg.ground.min_inliers =
+    this->declare_parameter<int>("ground.min_inliers", cfg.ground.min_inliers);
+  cfg.ground.max_plane_offset =
+    this->declare_parameter<double>("ground.max_plane_offset", cfg.ground.max_plane_offset);
+  cfg.ground.nominal_z =
+    this->declare_parameter<double>("ground.nominal_z", cfg.ground.nominal_z);
+  cfg.ground.clearance_height =
+    this->declare_parameter<double>("ground.clearance_height", cfg.ground.clearance_height);
+  cfg.ground.level_to_ground =
+    this->declare_parameter<bool>("ground.level_to_ground", cfg.ground.level_to_ground);
 
   // Outlier removal
-  cfg.outlier.ror_enabled = this->declare_parameter<bool>("outlier.ror_enabled", true);
-  cfg.outlier.ror_radius = this->declare_parameter<double>("outlier.ror_radius", 0.06);
-  cfg.outlier.ror_min_neighbors = this->declare_parameter<int>("outlier.ror_min_neighbors", 3);
-  cfg.outlier.sor_enabled = this->declare_parameter<bool>("outlier.sor_enabled", true);
-  cfg.outlier.sor_mean_k = this->declare_parameter<int>("outlier.sor_mean_k", 12);
-  cfg.outlier.sor_stddev_mul = this->declare_parameter<double>("outlier.sor_stddev_mul", 2.5);
+  cfg.outlier.ror_enabled =
+    this->declare_parameter<bool>("outlier.ror_enabled", cfg.outlier.ror_enabled);
+  cfg.outlier.ror_radius =
+    this->declare_parameter<double>("outlier.ror_radius", cfg.outlier.ror_radius);
+  cfg.outlier.ror_min_neighbors =
+    this->declare_parameter<int>("outlier.ror_min_neighbors", cfg.outlier.ror_min_neighbors);
+  cfg.outlier.sor_enabled =
+    this->declare_parameter<bool>("outlier.sor_enabled", cfg.outlier.sor_enabled);
+  cfg.outlier.sor_mean_k =
+    this->declare_parameter<int>("outlier.sor_mean_k", cfg.outlier.sor_mean_k);
+  cfg.outlier.sor_stddev_mul =
+    this->declare_parameter<double>("outlier.sor_stddev_mul", cfg.outlier.sor_stddev_mul);
 
   // Clustering
-  cfg.cluster.tolerance = this->declare_parameter<double>("cluster.tolerance", 0.06);
-  cfg.cluster.min_size = this->declare_parameter<int>("cluster.min_size", 25);
-  cfg.cluster.max_size = this->declare_parameter<int>("cluster.max_size", 25000);
+  cfg.cluster.tolerance =
+    this->declare_parameter<double>("cluster.tolerance", cfg.cluster.tolerance);
+  cfg.cluster.min_size = this->declare_parameter<int>("cluster.min_size", cfg.cluster.min_size);
+  cfg.cluster.max_size = this->declare_parameter<int>("cluster.max_size", cfg.cluster.max_size);
 
   // Size & quality gates
-  cfg.gate.min_points = this->declare_parameter<int>("gate.min_points", 35);
-  cfg.gate.min_xy_span = this->declare_parameter<double>("gate.min_xy_span", 0.18);
-  cfg.gate.max_xy_span = this->declare_parameter<double>("gate.max_xy_span", 0.50);
-  cfg.gate.min_z = this->declare_parameter<double>("gate.min_z", 0.20);
-  cfg.gate.max_z = this->declare_parameter<double>("gate.max_z", 0.45);
-  cfg.gate.max_bottom_z = this->declare_parameter<double>("gate.max_bottom_z", 0.25);
-  cfg.gate.height_consistency_tol =
-    this->declare_parameter<double>("gate.height_consistency_tol", 0.07);
-  cfg.gate.min_inlier_ratio = this->declare_parameter<double>("gate.min_inlier_ratio", 0.50);
-  cfg.gate.max_rmse = this->declare_parameter<double>("gate.max_rmse", 0.040);
+  cfg.gate.min_points = this->declare_parameter<int>("gate.min_points", cfg.gate.min_points);
+  cfg.gate.min_xy_span = this->declare_parameter<double>("gate.min_xy_span", cfg.gate.min_xy_span);
+  cfg.gate.max_xy_span = this->declare_parameter<double>("gate.max_xy_span", cfg.gate.max_xy_span);
+  cfg.gate.min_z = this->declare_parameter<double>("gate.min_z", cfg.gate.min_z);
+  cfg.gate.max_z = this->declare_parameter<double>("gate.max_z", cfg.gate.max_z);
+  cfg.gate.max_bottom_z =
+    this->declare_parameter<double>("gate.max_bottom_z", cfg.gate.max_bottom_z);
+  cfg.gate.height_consistency_tol = this->declare_parameter<double>(
+    "gate.height_consistency_tol", cfg.gate.height_consistency_tol);
+  cfg.gate.min_inlier_ratio =
+    this->declare_parameter<double>("gate.min_inlier_ratio", cfg.gate.min_inlier_ratio);
+  cfg.gate.max_rmse = this->declare_parameter<double>("gate.max_rmse", cfg.gate.max_rmse);
 
   // Box dimensions & fitting
-  cfg.fitting.length = this->declare_parameter<double>("box.length", 0.35);
-  cfg.fitting.width = this->declare_parameter<double>("box.width", 0.35);
-  cfg.fitting.height = this->declare_parameter<double>("box.height", 0.35);
+  cfg.fitting.length = this->declare_parameter<double>("box.length", cfg.fitting.length);
+  cfg.fitting.width = this->declare_parameter<double>("box.width", cfg.fitting.width);
+  cfg.fitting.height = this->declare_parameter<double>("box.height", cfg.fitting.height);
   cfg.fitting.range_bias_offset =
-    this->declare_parameter<double>("box.range_bias_offset", 0.0);
+    this->declare_parameter<double>("box.range_bias_offset", cfg.fitting.range_bias_offset);
 
-  cfg.fitting.closeness_d0 = this->declare_parameter<double>("fitting.closeness_d0", 0.01);
-  cfg.fitting.coarse_step_deg = this->declare_parameter<double>("fitting.coarse_step_deg", 1.0);
-  cfg.fitting.fine_step_deg = this->declare_parameter<double>("fitting.fine_step_deg", 0.1);
-  cfg.fitting.top_band_thickness =
-    this->declare_parameter<double>("fitting.top_band_thickness", 0.030);
-  cfg.fitting.side_min_z = this->declare_parameter<double>("fitting.side_min_z", 0.05);
+  cfg.fitting.closeness_d0 =
+    this->declare_parameter<double>("fitting.closeness_d0", cfg.fitting.closeness_d0);
+  cfg.fitting.coarse_step_deg =
+    this->declare_parameter<double>("fitting.coarse_step_deg", cfg.fitting.coarse_step_deg);
+  cfg.fitting.fine_step_deg =
+    this->declare_parameter<double>("fitting.fine_step_deg", cfg.fitting.fine_step_deg);
+  cfg.fitting.top_band_thickness = this->declare_parameter<double>(
+    "fitting.top_band_thickness", cfg.fitting.top_band_thickness);
+  cfg.fitting.side_min_z =
+    this->declare_parameter<double>("fitting.side_min_z", cfg.fitting.side_min_z);
   cfg.fitting.side_top_margin =
-    this->declare_parameter<double>("fitting.side_top_margin", 0.045);
-  cfg.fitting.top_min_points = this->declare_parameter<int>("fitting.top_min_points", 10);
-  cfg.fitting.top_max_z_mad = this->declare_parameter<double>("fitting.top_max_z_mad", 0.025);
-  cfg.fitting.face_band = this->declare_parameter<double>("fitting.face_band", 0.035);
-  cfg.fitting.two_face_min_span =
-    this->declare_parameter<double>("fitting.two_face_min_span", 0.12);
-  cfg.fitting.two_face_min_pts = this->declare_parameter<int>("fitting.two_face_min_pts", 12);
-  cfg.fitting.two_face_min_excl_span =
-    this->declare_parameter<double>("fitting.two_face_min_excl_span", 0.08);
-  cfg.fitting.huber_delta = this->declare_parameter<double>("fitting.huber_delta", 0.015);
-  cfg.fitting.ransac_line_iters = this->declare_parameter<int>("fitting.ransac_line_iters", 100);
-  cfg.fitting.ransac_line_thresh =
-    this->declare_parameter<double>("fitting.ransac_line_thresh", 0.020);
+    this->declare_parameter<double>("fitting.side_top_margin", cfg.fitting.side_top_margin);
+  cfg.fitting.top_min_points =
+    this->declare_parameter<int>("fitting.top_min_points", cfg.fitting.top_min_points);
+  cfg.fitting.top_max_z_mad =
+    this->declare_parameter<double>("fitting.top_max_z_mad", cfg.fitting.top_max_z_mad);
+  cfg.fitting.face_band =
+    this->declare_parameter<double>("fitting.face_band", cfg.fitting.face_band);
+  cfg.fitting.two_face_min_span = this->declare_parameter<double>(
+    "fitting.two_face_min_span", cfg.fitting.two_face_min_span);
+  cfg.fitting.two_face_min_pts =
+    this->declare_parameter<int>("fitting.two_face_min_pts", cfg.fitting.two_face_min_pts);
+  cfg.fitting.two_face_min_excl_span = this->declare_parameter<double>(
+    "fitting.two_face_min_excl_span", cfg.fitting.two_face_min_excl_span);
+  cfg.fitting.huber_delta =
+    this->declare_parameter<double>("fitting.huber_delta", cfg.fitting.huber_delta);
+  cfg.fitting.ransac_line_iters =
+    this->declare_parameter<int>("fitting.ransac_line_iters", cfg.fitting.ransac_line_iters);
+  cfg.fitting.ransac_line_thresh = this->declare_parameter<double>(
+    "fitting.ransac_line_thresh", cfg.fitting.ransac_line_thresh);
   cfg.fitting.enable_se2_refine =
-    this->declare_parameter<bool>("fitting.enable_se2_refine", true);
-  cfg.fitting.se2_max_iters = this->declare_parameter<int>("fitting.se2_max_iters", 10);
-  cfg.fitting.se2_max_shift = this->declare_parameter<double>("fitting.se2_max_shift", 0.04);
-  cfg.fitting.se2_max_angle_deg =
-    this->declare_parameter<double>("fitting.se2_max_angle_deg", 6.0);
-  cfg.fitting.inlier_dist_thresh =
-    this->declare_parameter<double>("fitting.inlier_dist_thresh", 0.030);
+    this->declare_parameter<bool>("fitting.enable_se2_refine", cfg.fitting.enable_se2_refine);
+  cfg.fitting.se2_max_iters =
+    this->declare_parameter<int>("fitting.se2_max_iters", cfg.fitting.se2_max_iters);
+  cfg.fitting.se2_max_shift =
+    this->declare_parameter<double>("fitting.se2_max_shift", cfg.fitting.se2_max_shift);
+  cfg.fitting.se2_max_angle_deg = this->declare_parameter<double>(
+    "fitting.se2_max_angle_deg", cfg.fitting.se2_max_angle_deg);
+  cfg.fitting.inlier_dist_thresh = this->declare_parameter<double>(
+    "fitting.inlier_dist_thresh", cfg.fitting.inlier_dist_thresh);
 
   // Tracker & lock gating
-  cfg.tracker.max_assoc_dist = this->declare_parameter<double>("tracker.max_assoc_dist", 0.25);
-  cfg.tracker.min_hits = this->declare_parameter<int>("tracker.min_hits", 2);
-  cfg.tracker.max_missed_frames = this->declare_parameter<int>("tracker.max_missed_frames", 3);
-  cfg.tracker.kf_process_noise_pos =
-    this->declare_parameter<double>("tracker.kf_process_noise_pos", 0.020);
-  cfg.tracker.kf_process_noise_vel =
-    this->declare_parameter<double>("tracker.kf_process_noise_vel", 0.80);
-  cfg.tracker.kf_meas_noise_pos =
-    this->declare_parameter<double>("tracker.kf_meas_noise_pos", 0.015);
-  cfg.tracker.kf_vel_damping = this->declare_parameter<double>("tracker.kf_vel_damping", 0.95);
-  cfg.tracker.yaw_alpha = this->declare_parameter<double>("tracker.yaw_alpha", 0.45);
-  cfg.tracker.switch_hysteresis_m =
-    this->declare_parameter<double>("tracker.switch_hysteresis_m", 0.15);
+  cfg.tracker.max_assoc_dist =
+    this->declare_parameter<double>("tracker.max_assoc_dist", cfg.tracker.max_assoc_dist);
+  cfg.tracker.min_hits = this->declare_parameter<int>("tracker.min_hits", cfg.tracker.min_hits);
+  cfg.tracker.max_missed_frames =
+    this->declare_parameter<int>("tracker.max_missed_frames", cfg.tracker.max_missed_frames);
+  cfg.tracker.kf_process_noise_pos = this->declare_parameter<double>(
+    "tracker.kf_process_noise_pos", cfg.tracker.kf_process_noise_pos);
+  cfg.tracker.kf_process_noise_vel = this->declare_parameter<double>(
+    "tracker.kf_process_noise_vel", cfg.tracker.kf_process_noise_vel);
+  cfg.tracker.kf_meas_noise_pos = this->declare_parameter<double>(
+    "tracker.kf_meas_noise_pos", cfg.tracker.kf_meas_noise_pos);
+  cfg.tracker.kf_vel_damping =
+    this->declare_parameter<double>("tracker.kf_vel_damping", cfg.tracker.kf_vel_damping);
+  cfg.tracker.yaw_alpha =
+    this->declare_parameter<double>("tracker.yaw_alpha", cfg.tracker.yaw_alpha);
+  cfg.tracker.switch_hysteresis_m = this->declare_parameter<double>(
+    "tracker.switch_hysteresis_m", cfg.tracker.switch_hysteresis_m);
 
-  cfg.tracker.lock_min_points = this->declare_parameter<int>("lock.min_points", 80);
-  cfg.tracker.lock_min_inlier_ratio =
-    this->declare_parameter<double>("lock.min_inlier_ratio", 0.70);
-  cfg.tracker.lock_max_rmse = this->declare_parameter<double>("lock.max_rmse", 0.025);
-  cfg.tracker.lock_window_frames = this->declare_parameter<int>("lock.window_frames", 3);
-  cfg.tracker.lock_max_pos_jitter =
-    this->declare_parameter<double>("lock.max_pos_jitter", 0.015);
-  cfg.tracker.lock_max_yaw_jitter_deg =
-    this->declare_parameter<double>("lock.max_yaw_jitter_deg", 3.0);
+  cfg.tracker.lock_min_points =
+    this->declare_parameter<int>("lock.min_points", cfg.tracker.lock_min_points);
+  cfg.tracker.lock_min_inlier_ratio = this->declare_parameter<double>(
+    "lock.min_inlier_ratio", cfg.tracker.lock_min_inlier_ratio);
+  cfg.tracker.lock_max_rmse =
+    this->declare_parameter<double>("lock.max_rmse", cfg.tracker.lock_max_rmse);
+  cfg.tracker.lock_window_frames =
+    this->declare_parameter<int>("lock.window_frames", cfg.tracker.lock_window_frames);
+  cfg.tracker.lock_max_pos_jitter = this->declare_parameter<double>(
+    "lock.max_pos_jitter", cfg.tracker.lock_max_pos_jitter);
+  cfg.tracker.lock_max_yaw_jitter_deg = this->declare_parameter<double>(
+    "lock.max_yaw_jitter_deg", cfg.tracker.lock_max_yaw_jitter_deg);
 
   // Debug
-  debug_publish_clouds_ = this->declare_parameter<bool>("debug.publish_clouds", false);
-  debug_publish_roi_marker_ = this->declare_parameter<bool>("debug.publish_roi_marker", true);
+  debug_publish_clouds_ =
+    this->declare_parameter<bool>("debug.publish_clouds", debug_publish_clouds_);
+  debug_publish_roi_marker_ =
+    this->declare_parameter<bool>("debug.publish_roi_marker", debug_publish_roi_marker_);
+  debug_publish_rejected_markers_ = this->declare_parameter<bool>(
+    "debug.publish_rejected_markers", debug_publish_rejected_markers_);
 
   pipeline_.setConfig(cfg);
+}
+
+rcl_interfaces::msg::SetParametersResult MidtoboxDetectorNode::onParametersSet(
+  const std::vector<rclcpp::Parameter> & params)
+{
+  rcl_interfaces::msg::SetParametersResult res;
+  res.successful = true;
+
+  PipelineConfig next_cfg = pipeline_.config();
+  MountingConfig next_mounting = mounting_cfg_;
+  PreFilterConfig next_prefilter = prefilter_cfg_;
+  double next_window_dur = window_duration_sec_;
+  int next_window_max = window_max_frames_;
+  double next_odom_age = odom_tf_max_age_sec_;
+  double next_pad = storage_roi_padding_;
+  std::string next_output_frame = output_frame_;
+  bool next_pub_roi = debug_publish_roi_marker_;
+  bool next_pub_rej = debug_publish_rejected_markers_;
+  bool mounting_changed = false;
+
+  for (const auto & p : params) {
+    const std::string & name = p.get_name();
+
+    // Startup-only parameters (subscriptions, publishers, static frame names)
+    if (name == "input_topic" || name == "input_format" || name == "qos_reliability" ||
+        name == "base_frame" || name == "lidar_frame" || name == "odom_frame" ||
+        name == "publish_static_tf" || name == "debug.publish_clouds" ||
+        name.rfind("topics.", 0) == 0)
+    {
+      res.successful = false;
+      res.reason = "Parameter '" + name + "' requires node restart";
+      return res;
+    }
+
+    if (name == "output_frame") {
+      next_output_frame = stripLeadingSlash(p.as_string());
+    } else if (name == "mounting.inverted") {
+      next_mounting.inverted = p.as_bool();
+      mounting_changed = true;
+    } else if (name == "mounting.x") {
+      next_mounting.x = p.as_double();
+      mounting_changed = true;
+    } else if (name == "mounting.y") {
+      next_mounting.y = p.as_double();
+      mounting_changed = true;
+    } else if (name == "mounting.z") {
+      next_mounting.z = p.as_double();
+      mounting_changed = true;
+    } else if (name == "mounting.roll_deg") {
+      next_mounting.roll_deg = p.as_double();
+      mounting_changed = true;
+    } else if (name == "mounting.pitch_deg") {
+      next_mounting.pitch_deg = p.as_double();
+      mounting_changed = true;
+    } else if (name == "mounting.yaw_deg") {
+      next_mounting.yaw_deg = p.as_double();
+      mounting_changed = true;
+    } else if (name == "window.duration_sec") {
+      if (p.as_double() < 0.0) {
+        res.successful = false;
+        res.reason = "window.duration_sec must be >= 0";
+        return res;
+      }
+      next_window_dur = p.as_double();
+    } else if (name == "window.max_frames") {
+      if (p.as_int() < 1) {
+        res.successful = false;
+        res.reason = "window.max_frames must be >= 1";
+        return res;
+      }
+      next_window_max = static_cast<int>(p.as_int());
+    } else if (name == "window.odom_tf_max_age_sec") {
+      next_odom_age = p.as_double();
+    } else if (name == "window.storage_roi_padding") {
+      next_pad = p.as_double();
+    } else if (name == "prefilter.min_range") {
+      next_prefilter.min_range = p.as_double();
+    } else if (name == "prefilter.max_range") {
+      next_prefilter.max_range = p.as_double();
+    } else if (name == "prefilter.use_tag_filter") {
+      next_prefilter.use_tag_filter = p.as_bool();
+    } else if (name == "prefilter.tag_reject_mask") {
+      const int m = static_cast<int>(p.as_int());
+      if (m < 0 || m > 255) {
+        res.successful = false;
+        res.reason = "prefilter.tag_reject_mask must be in [0, 255]";
+        return res;
+      }
+      next_prefilter.tag_reject_mask = static_cast<uint8_t>(m);
+    } else if (name == "crop.ego_enabled") {
+      next_cfg.crop.ego_enabled = p.as_bool();
+    } else if (name == "crop.ego_min_x") {
+      next_cfg.crop.ego_min_x = p.as_double();
+    } else if (name == "crop.ego_max_x") {
+      next_cfg.crop.ego_max_x = p.as_double();
+    } else if (name == "crop.ego_min_y") {
+      next_cfg.crop.ego_min_y = p.as_double();
+    } else if (name == "crop.ego_max_y") {
+      next_cfg.crop.ego_max_y = p.as_double();
+    } else if (name == "crop.ego_min_z") {
+      next_cfg.crop.ego_min_z = p.as_double();
+    } else if (name == "crop.ego_max_z") {
+      next_cfg.crop.ego_max_z = p.as_double();
+    } else if (name == "crop.roi_min_x") {
+      next_cfg.crop.roi_min_x = p.as_double();
+    } else if (name == "crop.roi_max_x") {
+      next_cfg.crop.roi_max_x = p.as_double();
+    } else if (name == "crop.roi_min_y") {
+      next_cfg.crop.roi_min_y = p.as_double();
+    } else if (name == "crop.roi_max_y") {
+      next_cfg.crop.roi_max_y = p.as_double();
+    } else if (name == "crop.roi_min_z") {
+      next_cfg.crop.roi_min_z = p.as_double();
+    } else if (name == "crop.roi_max_z") {
+      next_cfg.crop.roi_max_z = p.as_double();
+    } else if (name == "crop.voxel_leaf_size") {
+      next_cfg.crop.voxel_leaf_size = p.as_double();
+    } else if (name == "ground.use_ransac") {
+      next_cfg.ground.use_ransac = p.as_bool();
+    } else if (name == "ground.band_min_z") {
+      next_cfg.ground.band_min_z = p.as_double();
+    } else if (name == "ground.band_max_z") {
+      next_cfg.ground.band_max_z = p.as_double();
+    } else if (name == "ground.max_tilt_deg") {
+      next_cfg.ground.max_tilt_deg = p.as_double();
+    } else if (name == "ground.ransac_dist_thresh") {
+      next_cfg.ground.ransac_dist_thresh = p.as_double();
+    } else if (name == "ground.ransac_max_iter") {
+      next_cfg.ground.ransac_max_iter = static_cast<int>(p.as_int());
+    } else if (name == "ground.min_inliers") {
+      next_cfg.ground.min_inliers = static_cast<int>(p.as_int());
+    } else if (name == "ground.max_plane_offset") {
+      next_cfg.ground.max_plane_offset = p.as_double();
+    } else if (name == "ground.nominal_z") {
+      next_cfg.ground.nominal_z = p.as_double();
+    } else if (name == "ground.clearance_height") {
+      next_cfg.ground.clearance_height = p.as_double();
+    } else if (name == "ground.level_to_ground") {
+      next_cfg.ground.level_to_ground = p.as_bool();
+    } else if (name == "outlier.ror_enabled") {
+      next_cfg.outlier.ror_enabled = p.as_bool();
+    } else if (name == "outlier.ror_radius") {
+      next_cfg.outlier.ror_radius = p.as_double();
+    } else if (name == "outlier.ror_min_neighbors") {
+      next_cfg.outlier.ror_min_neighbors = static_cast<int>(p.as_int());
+    } else if (name == "outlier.sor_enabled") {
+      next_cfg.outlier.sor_enabled = p.as_bool();
+    } else if (name == "outlier.sor_mean_k") {
+      next_cfg.outlier.sor_mean_k = static_cast<int>(p.as_int());
+    } else if (name == "outlier.sor_stddev_mul") {
+      next_cfg.outlier.sor_stddev_mul = p.as_double();
+    } else if (name == "cluster.tolerance") {
+      if (p.as_double() <= 0.0) {
+        res.successful = false;
+        res.reason = "cluster.tolerance must be > 0";
+        return res;
+      }
+      next_cfg.cluster.tolerance = p.as_double();
+    } else if (name == "cluster.min_size") {
+      next_cfg.cluster.min_size = static_cast<int>(p.as_int());
+    } else if (name == "cluster.max_size") {
+      next_cfg.cluster.max_size = static_cast<int>(p.as_int());
+    } else if (name == "gate.min_points") {
+      next_cfg.gate.min_points = static_cast<int>(p.as_int());
+    } else if (name == "gate.min_xy_span") {
+      next_cfg.gate.min_xy_span = p.as_double();
+    } else if (name == "gate.max_xy_span") {
+      next_cfg.gate.max_xy_span = p.as_double();
+    } else if (name == "gate.min_z") {
+      next_cfg.gate.min_z = p.as_double();
+    } else if (name == "gate.max_z") {
+      next_cfg.gate.max_z = p.as_double();
+    } else if (name == "gate.max_bottom_z") {
+      next_cfg.gate.max_bottom_z = p.as_double();
+    } else if (name == "gate.height_consistency_tol") {
+      next_cfg.gate.height_consistency_tol = p.as_double();
+    } else if (name == "gate.min_inlier_ratio") {
+      next_cfg.gate.min_inlier_ratio = p.as_double();
+    } else if (name == "gate.max_rmse") {
+      next_cfg.gate.max_rmse = p.as_double();
+    } else if (name == "box.length" || name == "box.width" || name == "box.height") {
+      if (p.as_double() <= 0.02) {
+        res.successful = false;
+        res.reason = name + " must be > 0.02 m";
+        return res;
+      }
+      if (name == "box.length") {
+        next_cfg.fitting.length = p.as_double();
+      } else if (name == "box.width") {
+        next_cfg.fitting.width = p.as_double();
+      } else {
+        next_cfg.fitting.height = p.as_double();
+      }
+    } else if (name == "box.range_bias_offset") {
+      next_cfg.fitting.range_bias_offset = p.as_double();
+    } else if (name == "fitting.closeness_d0") {
+      next_cfg.fitting.closeness_d0 = p.as_double();
+    } else if (name == "fitting.coarse_step_deg") {
+      next_cfg.fitting.coarse_step_deg = p.as_double();
+    } else if (name == "fitting.fine_step_deg") {
+      next_cfg.fitting.fine_step_deg = p.as_double();
+    } else if (name == "fitting.top_band_thickness") {
+      next_cfg.fitting.top_band_thickness = p.as_double();
+    } else if (name == "fitting.side_min_z") {
+      next_cfg.fitting.side_min_z = p.as_double();
+    } else if (name == "fitting.side_top_margin") {
+      next_cfg.fitting.side_top_margin = p.as_double();
+    } else if (name == "fitting.top_min_points") {
+      next_cfg.fitting.top_min_points = static_cast<int>(p.as_int());
+    } else if (name == "fitting.top_max_z_mad") {
+      next_cfg.fitting.top_max_z_mad = p.as_double();
+    } else if (name == "fitting.face_band") {
+      next_cfg.fitting.face_band = p.as_double();
+    } else if (name == "fitting.two_face_min_span") {
+      next_cfg.fitting.two_face_min_span = p.as_double();
+    } else if (name == "fitting.two_face_min_pts") {
+      next_cfg.fitting.two_face_min_pts = static_cast<int>(p.as_int());
+    } else if (name == "fitting.two_face_min_excl_span") {
+      next_cfg.fitting.two_face_min_excl_span = p.as_double();
+    } else if (name == "fitting.huber_delta") {
+      next_cfg.fitting.huber_delta = p.as_double();
+    } else if (name == "fitting.ransac_line_iters") {
+      next_cfg.fitting.ransac_line_iters = static_cast<int>(p.as_int());
+    } else if (name == "fitting.ransac_line_thresh") {
+      next_cfg.fitting.ransac_line_thresh = p.as_double();
+    } else if (name == "fitting.enable_se2_refine") {
+      next_cfg.fitting.enable_se2_refine = p.as_bool();
+    } else if (name == "fitting.se2_max_iters") {
+      next_cfg.fitting.se2_max_iters = static_cast<int>(p.as_int());
+    } else if (name == "fitting.se2_max_shift") {
+      next_cfg.fitting.se2_max_shift = p.as_double();
+    } else if (name == "fitting.se2_max_angle_deg") {
+      next_cfg.fitting.se2_max_angle_deg = p.as_double();
+    } else if (name == "fitting.inlier_dist_thresh") {
+      next_cfg.fitting.inlier_dist_thresh = p.as_double();
+    } else if (name == "tracker.max_assoc_dist") {
+      next_cfg.tracker.max_assoc_dist = p.as_double();
+    } else if (name == "tracker.min_hits") {
+      next_cfg.tracker.min_hits = static_cast<int>(p.as_int());
+    } else if (name == "tracker.max_missed_frames") {
+      next_cfg.tracker.max_missed_frames = static_cast<int>(p.as_int());
+    } else if (name == "tracker.kf_process_noise_pos") {
+      next_cfg.tracker.kf_process_noise_pos = p.as_double();
+    } else if (name == "tracker.kf_process_noise_vel") {
+      next_cfg.tracker.kf_process_noise_vel = p.as_double();
+    } else if (name == "tracker.kf_meas_noise_pos") {
+      next_cfg.tracker.kf_meas_noise_pos = p.as_double();
+    } else if (name == "tracker.kf_vel_damping") {
+      next_cfg.tracker.kf_vel_damping = p.as_double();
+    } else if (name == "tracker.yaw_alpha") {
+      next_cfg.tracker.yaw_alpha = p.as_double();
+    } else if (name == "tracker.switch_hysteresis_m") {
+      next_cfg.tracker.switch_hysteresis_m = p.as_double();
+    } else if (name == "lock.min_points") {
+      next_cfg.tracker.lock_min_points = static_cast<int>(p.as_int());
+    } else if (name == "lock.min_inlier_ratio") {
+      next_cfg.tracker.lock_min_inlier_ratio = p.as_double();
+    } else if (name == "lock.max_rmse") {
+      next_cfg.tracker.lock_max_rmse = p.as_double();
+    } else if (name == "lock.window_frames") {
+      next_cfg.tracker.lock_window_frames = static_cast<int>(p.as_int());
+    } else if (name == "lock.max_pos_jitter") {
+      next_cfg.tracker.lock_max_pos_jitter = p.as_double();
+    } else if (name == "lock.max_yaw_jitter_deg") {
+      next_cfg.tracker.lock_max_yaw_jitter_deg = p.as_double();
+    } else if (name == "debug.publish_roi_marker") {
+      next_pub_roi = p.as_bool();
+    } else if (name == "debug.publish_rejected_markers") {
+      next_pub_rej = p.as_bool();
+    }
+  }
+
+  // Commit atomically
+  pipeline_.setConfig(next_cfg);
+  mounting_cfg_ = next_mounting;
+  prefilter_cfg_ = next_prefilter;
+  window_duration_sec_ = next_window_dur;
+  window_max_frames_ = next_window_max;
+  odom_tf_max_age_sec_ = next_odom_age;
+  storage_roi_padding_ = next_pad;
+  output_frame_ = next_output_frame;
+  debug_publish_roi_marker_ = next_pub_roi;
+  debug_publish_rejected_markers_ = next_pub_rej;
+
+  if (mounting_changed) {
+    T_base_lidar_ = mounting_cfg_.computeTransform();
+    window_buffer_.clear();
+    pipeline_.resetTracker();
+    has_prev_odom_ = false;
+    if (publish_static_tf_ && static_tf_broadcaster_) {
+      publishStaticLidarTf();
+    }
+  }
+
+  return res;
 }
 
 void MidtoboxDetectorNode::publishStaticLidarTf()
@@ -943,48 +1309,50 @@ void MidtoboxDetectorNode::publishResults(
   }
 
   // Oversized touching/stacked clusters flagged visibly in red/orange
-  for (const auto & rej : res.rejected_clusters) {
-    if (!rej.is_oversized) {
-      continue;
+  if (debug_publish_rejected_markers_) {
+    for (const auto & rej : res.rejected_clusters) {
+      if (!rej.is_oversized) {
+        continue;
+      }
+      const Eigen::Vector3d pos_out = T_out_base * rej.center;
+      const Eigen::Quaterniond q_rej_base(Eigen::AngleAxisd(rej.yaw, Eigen::Vector3d::UnitZ()));
+      const Eigen::Quaterniond q_out = (q_out_base * q_rej_base).normalized();
+
+      visualization_msgs::msg::Marker box;
+      box.header.stamp = stamp;
+      box.header.frame_id = out_frame;
+      box.ns = "rejected_oversized";
+      box.id = marker_id++;
+      box.type = visualization_msgs::msg::Marker::CUBE;
+      box.action = visualization_msgs::msg::Marker::ADD;
+      box.pose = eigenPoseToMsg(pos_out, q_out);
+      box.scale.x = rej.size.x();
+      box.scale.y = rej.size.y();
+      box.scale.z = rej.size.z();
+      box.color.r = 1.0f; box.color.g = 0.25f; box.color.b = 0.05f; box.color.a = 0.35f;
+      marker_array.markers.push_back(box);
+
+      const Eigen::Vector3d rej_label_pos_out =
+        T_out_base * (rej.center + Eigen::Vector3d(0.0, 0.0, 0.5 * rej.size.z() + 0.10));
+      visualization_msgs::msg::Marker text;
+      text.header = box.header;
+      text.ns = "rejected_labels";
+      text.id = marker_id++;
+      text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+      text.action = visualization_msgs::msg::Marker::ADD;
+      text.pose.position.x = rej_label_pos_out.x();
+      text.pose.position.y = rej_label_pos_out.y();
+      text.pose.position.z = rej_label_pos_out.z();
+      text.pose.orientation.w = 1.0;
+      text.scale.z = 0.07;
+      text.color.r = 1.0f; text.color.g = 0.4f; text.color.b = 0.2f; text.color.a = 1.0f;
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(2)
+          << "REJECT: " << rej.reason << "\n"
+          << rej.size.x() << "x" << rej.size.y() << "x" << rej.size.z() << "m";
+      text.text = oss.str();
+      marker_array.markers.push_back(text);
     }
-    const Eigen::Vector3d pos_out = T_out_base * rej.center;
-    const Eigen::Quaterniond q_rej_base(Eigen::AngleAxisd(rej.yaw, Eigen::Vector3d::UnitZ()));
-    const Eigen::Quaterniond q_out = (q_out_base * q_rej_base).normalized();
-
-    visualization_msgs::msg::Marker box;
-    box.header.stamp = stamp;
-    box.header.frame_id = out_frame;
-    box.ns = "rejected_oversized";
-    box.id = marker_id++;
-    box.type = visualization_msgs::msg::Marker::CUBE;
-    box.action = visualization_msgs::msg::Marker::ADD;
-    box.pose = eigenPoseToMsg(pos_out, q_out);
-    box.scale.x = rej.size.x();
-    box.scale.y = rej.size.y();
-    box.scale.z = rej.size.z();
-    box.color.r = 1.0f; box.color.g = 0.25f; box.color.b = 0.05f; box.color.a = 0.35f;
-    marker_array.markers.push_back(box);
-
-    const Eigen::Vector3d rej_label_pos_out =
-      T_out_base * (rej.center + Eigen::Vector3d(0.0, 0.0, 0.5 * rej.size.z() + 0.10));
-    visualization_msgs::msg::Marker text;
-    text.header = box.header;
-    text.ns = "rejected_labels";
-    text.id = marker_id++;
-    text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-    text.action = visualization_msgs::msg::Marker::ADD;
-    text.pose.position.x = rej_label_pos_out.x();
-    text.pose.position.y = rej_label_pos_out.y();
-    text.pose.position.z = rej_label_pos_out.z();
-    text.pose.orientation.w = 1.0;
-    text.scale.z = 0.07;
-    text.color.r = 1.0f; text.color.g = 0.4f; text.color.b = 0.2f; text.color.a = 1.0f;
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(2)
-        << "REJECT: " << rej.reason << "\n"
-        << rej.size.x() << "x" << rej.size.y() << "x" << rej.size.z() << "m";
-    text.text = oss.str();
-    marker_array.markers.push_back(text);
   }
 
   if (debug_publish_roi_marker_) {

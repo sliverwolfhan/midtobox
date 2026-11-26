@@ -1,72 +1,64 @@
 midtobox_detector:
   ros__parameters:
-    # -------------------------------------------------------------------------
-    # Input point cloud topic & format
-    # -------------------------------------------------------------------------
-    input_topic: "/livox/lidar"
-    # "pointcloud2" (livox_ros_driver2 xfer_format=0, default) or
-    # "custom_msg"  (livox_ros_driver2 xfer_format=1)
-    input_format: "pointcloud2"
-    # "best_effort" receives from BOTH RELIABLE (livox_ros_driver2) and
-    # BEST_EFFORT (SensorDataQoS / sim / bags) publishers under DDS RxO rules.
-    qos_reliability: "best_effort"
+    # =========================================================================
+    # 【一、常用调参区】上车调试 / 更换安装姿态 / 换块体材质时优先修改这里
+    # 支持运行期热修改（ros2 param set /midtobox_detector <参数名> <值>），
+    # 标注 [启动项] 的话题/框架开关修改后需重启节点。
+    # =========================================================================
 
     # -------------------------------------------------------------------------
-    # Coordinate frames & output frame switching
+    # 1. 输入/输出话题与坐标系
     # -------------------------------------------------------------------------
-    base_frame: "base_footprint"
-    lidar_frame: "livox_frame"
-    odom_frame: "odom"
-    # Default centroid output frame: "base_footprint".
-    # Switch to "livox_frame" or "odom" (when odom TF is active) as needed.
+    input_topic: "/livox/lidar"          # [启动项] 雷达输入话题
+    # [启动项] "pointcloud2" (livox_ros_driver2 xfer_format=0，默认) 或
+    #          "custom_msg"  (livox_ros_driver2 xfer_format=1)
+    input_format: "pointcloud2"
+    # [启动项] "best_effort" 可同时兼容 RELIABLE (驱动) 与 BEST_EFFORT (仿真/bag)
+    qos_reliability: "best_effort"
+
+    topics:                              # [启动项] 输出话题名称（按需自定义）
+      target_pose: "/midtobox/target_pose"
+      detections: "/midtobox/detections"
+      locked: "/midtobox/locked"
+      markers: "/midtobox/markers"
+      debug_accumulated_cloud: "/midtobox/debug/accumulated_cloud"
+      debug_non_ground_cloud: "/midtobox/debug/non_ground_cloud"
+
+    base_frame: "base_footprint"         # [启动项] 整平后的车体基准系
+    lidar_frame: "livox_frame"           # [启动项] 雷达坐标系
+    odom_frame: "odom"                   # [启动项] 里程计坐标系（有 TF 时自动运动补偿）
+    # 输出质心与姿态所在坐标系："base_footprint"（默认）、"livox_frame" 或 "odom"
     output_frame: "base_footprint"
-    # Publish static TF base_footprint -> livox_frame from mounting.* below.
-    # Set false if robot_state_publisher / URDF already publishes this transform.
+    # [启动项] 是否由本节点发布静态 TF (base_footprint -> livox_frame)；
+    # 若外部 URDF/定位节点已发布该 TF，请改为 false
     publish_static_tf: true
 
     # -------------------------------------------------------------------------
-    # Mid-360 mounting extrinsics (base_footprint -> livox_frame)
+    # 2. Mid-360 雷达安装外参 (base_footprint -> livox_frame)
     # -------------------------------------------------------------------------
     mounting:
-      # One-click toggle: true => inverted mounting (adds +180 deg roll,
-      # placing Mid-360 vertical FOV at [-52 deg, +7 deg] for floor + box top).
-      # Set false for upright mounting (roll = 0 deg + roll_deg trim).
-      inverted: true
-      x: 0.0
-      y: 0.0
-      z: 0.70            # Configurable mounting height (~0.60 - 0.80 m)
-      roll_deg: 0.0      # Fine roll calibration trim (deg)
-      pitch_deg: 0.0     # Fine pitch calibration trim (deg)
-      yaw_deg: 0.0       # Fine yaw calibration trim (deg)
+      inverted: true                     # 一键切换倒装(true, roll+180°) / 正装(false)
+      x: 0.0                             # 雷达相对 base_footprint 前后偏移 (m)
+      y: 0.0                             # 雷达相对 base_footprint 左右偏移 (m)
+      z: 0.70                            # 雷达离地安装高度 (m，README 建议 0.60~0.80)
+      roll_deg: 0.0                      # 安装滚转角微调 (deg)
+      pitch_deg: 0.0                     # 安装俯仰角微调 (deg)
+      yaw_deg: 0.0                       # 安装偏航角微调 (deg)
 
     # -------------------------------------------------------------------------
-    # Sliding-window accumulation (200 - 300 ms)
-    # Automatically uses odom -> base_footprint TF motion compensation when
-    # available, and gracefully falls back to static accumulation otherwise.
+    # 3. 目标方块物理尺寸与材质测距偏置
     # -------------------------------------------------------------------------
-    window:
-      duration_sec: 0.25
-      max_frames: 4
-      odom_tf_max_age_sec: 0.15
-      storage_roi_padding: 1.0
+    box:
+      length: 0.35                       # 目标块长 X (m)
+      width: 0.35                        # 目标块宽 Y (m)
+      height: 0.35                       # 目标块高 Z (m)
+      range_bias_offset: 0.0             # 实测材质系统测距补偿 (m，按实际方块表面标定)
 
     # -------------------------------------------------------------------------
-    # Mid-360 raw point pre-filtering (applied before PCL conversion)
-    # -------------------------------------------------------------------------
-    prefilter:
-      min_range: 0.25         # Rejects (0,0,0) invalid returns and near-field noise
-      max_range: 6.0
-      use_tag_filter: true
-      # Bitmask rejected on Livox Mid-360 tag byte:
-      #   0x3F (63) rejects near-field stray (0x10/0x20) + edge-dragging/low-refl (0x01..0x08)
-      #   0xFF (255) enforces strict tag == 0
-      tag_reject_mask: 63
-
-    # -------------------------------------------------------------------------
-    # Ego-vehicle 3D exclusion CropBox + workspace ROI (in leveled base_footprint)
+    # 4. 自车 3D 剔除盒 + 作业区 ROI（均在整平后的 base_footprint 下）
     # -------------------------------------------------------------------------
     crop:
-      ego_enabled: true
+      ego_enabled: true                  # 倒装强烈建议开启，挖空车体/支架/机械臂包络
       ego_min_x: -0.50
       ego_max_x: 0.40
       ego_min_y: -0.45
@@ -74,33 +66,89 @@ midtobox_detector:
       ego_min_z: -0.10
       ego_max_z: 1.10
 
-      roi_min_x: 0.45
-      roi_max_x: 3.20
+      roi_min_x: 0.45                    # 作业检测区近端 (m，避开 Mid-360 近距盲区)
+      roi_max_x: 3.20                    # 作业检测区远端 (m)
       roi_min_y: -1.20
       roi_max_y: 1.20
       roi_min_z: -0.25
       roi_max_z: 0.90
-      voxel_leaf_size: 0.0    # 0.0 = disabled (preserves sub-cm edge sharpness)
+      voxel_leaf_size: 0.0               # <= 0 禁用体素降采样（保留边缘亚厘米锐度）
 
     # -------------------------------------------------------------------------
-    # Tilt-constrained RANSAC ground plane removal & leveling
+    # 5. 滑动窗口累积（200~300 ms 解决 Mid-360 单帧花瓣稀疏）
+    # -------------------------------------------------------------------------
+    window:
+      duration_sec: 0.25                 # 累积时长 (s)
+      max_frames: 4                      # 窗口最大帧数
+      odom_tf_max_age_sec: 0.15          # odom TF 允许最大延迟，超时退化为静止累积
+      storage_roi_padding: 1.0           # 窗口缓存时相对 ROI 的外扩余量 (m)
+
+    # -------------------------------------------------------------------------
+    # 6. Mid-360 原始点云预过滤（转换 PCL 前剔除 (0,0,0) 与 tag 噪点）
+    # -------------------------------------------------------------------------
+    prefilter:
+      min_range: 0.25                    # 剔除 (0,0,0) 无效点及极近距杂散点 (m)
+      max_range: 6.0
+      use_tag_filter: true
+      # Mid-360 tag 位掩码剔除：
+      #   63  (0x3F) 剔除近距杂散(0x10/0x20) + 边缘拉丝/低反噪点(0x01..0x08)
+      #   255 (0xFF) 严格仅保留 tag == 0
+      tag_reject_mask: 63
+
+    # -------------------------------------------------------------------------
+    # 7. 地面分割与整平
     # -------------------------------------------------------------------------
     ground:
-      use_ransac: true
-      band_min_z: -0.25
-      band_max_z: 0.25
-      max_tilt_deg: 8.0
-      ransac_dist_thresh: 0.025
+      use_ransac: true                   # 倾角约束 RANSAC 拟合地面，兼容地面微倾
+      band_min_z: -0.25                  # 地面搜索 Z 带下界 (m)
+      band_max_z: 0.25                   # 地面搜索 Z 带上界 (m)
+      max_tilt_deg: 8.0                  # 允许最大地面倾角 (deg)
+      ransac_dist_thresh: 0.025          # 地面内点阈值 (m)
       ransac_max_iter: 200
       min_inliers: 30
-      max_plane_offset: 0.20
-      nominal_z: 0.0
-      clearance_height: 0.045
-      level_to_ground: true
+      max_plane_offset: 0.20             # 允许地面相对 nominal_z 的最大高度偏移 (m)
+      nominal_z: 0.0                     # 名义地面高度 (m)
+      clearance_height: 0.045            # 离地高于该值才算非地面目标点 (m)
+      level_to_ground: true              # true: 将点云整平到拟合地面再做拟合
 
     # -------------------------------------------------------------------------
-    # Edge-dragging ("veil") outlier suppression (ROR + per-cluster SOR)
+    # 8. 候选块尺寸/高度/质量门控（自动拒绝超大粘连/堆叠簇）
     # -------------------------------------------------------------------------
+    gate:
+      min_points: 35                     # 候选簇最少点数
+      min_xy_span: 0.18                  # 水平最小跨度 (m)
+      max_xy_span: 0.50                  # 水平最大跨度 (m，双块并排 ~0.70 m 会被拒判)
+      min_z: 0.20                        # 最小高度 (m)
+      max_z: 0.45                        # 最大高度 (m，上下堆叠 ~0.70 m 会被拒判)
+      max_bottom_z: 0.25                 # 底部离地最大高度 (m，过滤悬空杂物)
+      height_consistency_tol: 0.07       # 实测高度与 box.height 允许偏差 (m)
+      min_inlier_ratio: 0.50             # 单帧表面内点比例下限
+      max_rmse: 0.040                    # 单帧表面拟合 RMSE 上限 (m)
+
+    # -------------------------------------------------------------------------
+    # 9. 目标锁定判据（全部满足时 /midtobox/locked 输出 true）
+    # -------------------------------------------------------------------------
+    lock:
+      min_points: 80                     # 锁定所需最少点数
+      min_inlier_ratio: 0.70             # 锁定所需表面内点率
+      max_rmse: 0.025                    # 锁定所需最大 RMSE (m)
+      window_frames: 3                   # 连续稳定帧数窗口
+      max_pos_jitter: 0.015              # 连续帧质心最大抖动 (m)
+      max_yaw_jitter_deg: 3.0            # 连续帧偏航角最大抖动 (deg)
+
+    # -------------------------------------------------------------------------
+    # 10. 可视化与调试开关
+    # -------------------------------------------------------------------------
+    debug:
+      publish_clouds: false              # [启动项] 是否发布 ROI 与去地后的调试点云
+      publish_roi_marker: true           # 是否在 RViz 中画出 ROI 线框
+      publish_rejected_markers: true     # 是否在 RViz 中用红色标出超大拒判簇
+
+    # =========================================================================
+    # 【二、进阶算法参数区】一般保持默认即可，仅在精细调优时修改
+    # =========================================================================
+
+    # 11. 边缘拉丝飞点滤波（ROR + 每簇 SOR）
     outlier:
       ror_enabled: true
       ror_radius: 0.06
@@ -109,40 +157,13 @@ midtobox_detector:
       sor_mean_k: 12
       sor_stddev_mul: 2.5
 
-    # -------------------------------------------------------------------------
-    # PCL Euclidean clustering (separates cubes spaced >= 10 cm apart)
-    # -------------------------------------------------------------------------
+    # 12. PCL 欧氏聚类（分离间距 >= 10 cm 的独立块）
     cluster:
       tolerance: 0.06
       min_size: 25
       max_size: 25000
 
-    # -------------------------------------------------------------------------
-    # Target box dimensions & calibrated material range offset
-    # -------------------------------------------------------------------------
-    box:
-      length: 0.35
-      width: 0.35
-      height: 0.35
-      range_bias_offset: 0.0  # Calibrated per surface material (meters)
-
-    # -------------------------------------------------------------------------
-    # Candidate cluster gating & oversized touching/stacked cluster rejection
-    # -------------------------------------------------------------------------
-    gate:
-      min_points: 35
-      min_xy_span: 0.18
-      max_xy_span: 0.50       # Touching cubes (~0.70 m) cleanly flagged & rejected
-      min_z: 0.20
-      max_z: 0.45             # Stacked cubes (~0.70 m) cleanly flagged & rejected
-      max_bottom_z: 0.25
-      height_consistency_tol: 0.07
-      min_inlier_ratio: 0.50
-      max_rmse: 0.040
-
-    # -------------------------------------------------------------------------
-    # Known-size 2-face L-shape & 1-face front-only Huber fitting
-    # -------------------------------------------------------------------------
+    # 13. 已知尺寸 L-shape / 单正面 / 2D SE(2) Huber 拟合内部阈值
     fitting:
       closeness_d0: 0.01
       coarse_step_deg: 1.0
@@ -165,9 +186,7 @@ midtobox_detector:
       se2_max_angle_deg: 6.0
       inlier_dist_thresh: 0.030
 
-    # -------------------------------------------------------------------------
-    # Multi-object tracker (Hungarian + 6D KF + unwrapped yaw + hysteresis)
-    # -------------------------------------------------------------------------
+    # 14. 多目标跟踪（匈牙利匹配 + 6D 卡尔曼滤波 + 主目标滞回）
     tracker:
       max_assoc_dist: 0.25
       min_hits: 2
@@ -178,21 +197,3 @@ midtobox_detector:
       kf_vel_damping: 0.95
       yaw_alpha: 0.45
       switch_hysteresis_m: 0.15
-
-    # -------------------------------------------------------------------------
-    # Lock quality gating (/midtobox/locked)
-    # -------------------------------------------------------------------------
-    lock:
-      min_points: 80
-      min_inlier_ratio: 0.70
-      max_rmse: 0.025
-      window_frames: 3
-      max_pos_jitter: 0.015
-      max_yaw_jitter_deg: 3.0
-
-    # -------------------------------------------------------------------------
-    # Debug visualization
-    # -------------------------------------------------------------------------
-    debug:
-      publish_clouds: false
-      publish_roi_marker: true

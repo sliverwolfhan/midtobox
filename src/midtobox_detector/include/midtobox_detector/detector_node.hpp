@@ -20,9 +20,11 @@
 #include <deque>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
@@ -50,6 +52,8 @@ private:
   };
 
   void declareAndLoadParameters();
+  rcl_interfaces::msg::SetParametersResult onParametersSet(
+    const std::vector<rclcpp::Parameter> & params);
   void publishStaticLidarTf();
 
   void pointCloud2Callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
@@ -91,6 +95,12 @@ private:
   std::string input_topic_{"/livox/lidar"};
   std::string input_format_{"pointcloud2"};
   std::string qos_reliability_{"best_effort"};
+  std::string target_pose_topic_{"/midtobox/target_pose"};
+  std::string detections_topic_{"/midtobox/detections"};
+  std::string locked_topic_{"/midtobox/locked"};
+  std::string markers_topic_{"/midtobox/markers"};
+  std::string debug_accum_topic_{"/midtobox/debug/accumulated_cloud"};
+  std::string debug_nonground_topic_{"/midtobox/debug/non_ground_cloud"};
   std::string base_frame_{"base_footprint"};
   std::string lidar_frame_{"livox_frame"};
   std::string odom_frame_{"odom"};
@@ -108,6 +118,9 @@ private:
 
   bool debug_publish_clouds_{false};
   bool debug_publish_roi_marker_{true};
+  bool debug_publish_rejected_markers_{true};
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
 
   // Pipeline & sliding-window state
   DetectorPipeline pipeline_;
