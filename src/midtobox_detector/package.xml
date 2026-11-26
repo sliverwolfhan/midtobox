@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>midtobox_detector</name>
+  <version>0.1.0</version>
+  <description>
+    Livox Mid-360 3D cube centroid and yaw detector (PCL + Eigen, zero OpenCV)
+    adapting Zhang IV 2017 L-shape fitting, tilt-constrained RANSAC ground
+    segmentation, known-size partial-view centroid correction, and Hungarian +
+    Kalman multi-object tracking.
+  </description>
+  <maintainer email="dev@midtobox.local">midtobox</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>vision_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_eigen</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>pcl_conversions</depend>
+  <depend>livox_ros_driver2</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>eigen</depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

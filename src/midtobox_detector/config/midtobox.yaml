@@ -1,0 +1,198 @@
+midtobox_detector:
+  ros__parameters:
+    # -------------------------------------------------------------------------
+    # Input point cloud topic & format
+    # -------------------------------------------------------------------------
+    input_topic: "/livox/lidar"
+    # "pointcloud2" (livox_ros_driver2 xfer_format=0, default) or
+    # "custom_msg"  (livox_ros_driver2 xfer_format=1)
+    input_format: "pointcloud2"
+    # "best_effort" receives from BOTH RELIABLE (livox_ros_driver2) and
+    # BEST_EFFORT (SensorDataQoS / sim / bags) publishers under DDS RxO rules.
+    qos_reliability: "best_effort"
+
+    # -------------------------------------------------------------------------
+    # Coordinate frames & output frame switching
+    # -------------------------------------------------------------------------
+    base_frame: "base_footprint"
+    lidar_frame: "livox_frame"
+    odom_frame: "odom"
+    # Default centroid output frame: "base_footprint".
+    # Switch to "livox_frame" or "odom" (when odom TF is active) as needed.
+    output_frame: "base_footprint"
+    # Publish static TF base_footprint -> livox_frame from mounting.* below.
+    # Set false if robot_state_publisher / URDF already publishes this transform.
+    publish_static_tf: true
+
+    # -------------------------------------------------------------------------
+    # Mid-360 mounting extrinsics (base_footprint -> livox_frame)
+    # -------------------------------------------------------------------------
+    mounting:
+      # One-click toggle: true => inverted mounting (adds +180 deg roll,
+      # placing Mid-360 vertical FOV at [-52 deg, +7 deg] for floor + box top).
+      # Set false for upright mounting (roll = 0 deg + roll_deg trim).
+      inverted: true
+      x: 0.0
+      y: 0.0
+      z: 0.70            # Configurable mounting height (~0.60 - 0.80 m)
+      roll_deg: 0.0      # Fine roll calibration trim (deg)
+      pitch_deg: 0.0     # Fine pitch calibration trim (deg)
+      yaw_deg: 0.0       # Fine yaw calibration trim (deg)
+
+    # -------------------------------------------------------------------------
+    # Sliding-window accumulation (200 - 300 ms)
+    # Automatically uses odom -> base_footprint TF motion compensation when
+    # available, and gracefully falls back to static accumulation otherwise.
+    # -------------------------------------------------------------------------
+    window:
+      duration_sec: 0.25
+      max_frames: 4
+      odom_tf_max_age_sec: 0.15
+      storage_roi_padding: 1.0
+
+    # -------------------------------------------------------------------------
+    # Mid-360 raw point pre-filtering (applied before PCL conversion)
+    # -------------------------------------------------------------------------
+    prefilter:
+      min_range: 0.25         # Rejects (0,0,0) invalid returns and near-field noise
+      max_range: 6.0
+      use_tag_filter: true
+      # Bitmask rejected on Livox Mid-360 tag byte:
+      #   0x3F (63) rejects near-field stray (0x10/0x20) + edge-dragging/low-refl (0x01..0x08)
+      #   0xFF (255) enforces strict tag == 0
+      tag_reject_mask: 63
+
+    # -------------------------------------------------------------------------
+    # Ego-vehicle 3D exclusion CropBox + workspace ROI (in leveled base_footprint)
+    # -------------------------------------------------------------------------
+    crop:
+      ego_enabled: true
+      ego_min_x: -0.50
+      ego_max_x: 0.40
+      ego_min_y: -0.45
+      ego_max_y: 0.45
+      ego_min_z: -0.10
+      ego_max_z: 1.10
+
+      roi_min_x: 0.45
+      roi_max_x: 3.20
+      roi_min_y: -1.20
+      roi_max_y: 1.20
+      roi_min_z: -0.25
+      roi_max_z: 0.90
+      voxel_leaf_size: 0.0    # 0.0 = disabled (preserves sub-cm edge sharpness)
+
+    # -------------------------------------------------------------------------
+    # Tilt-constrained RANSAC ground plane removal & leveling
+    # -------------------------------------------------------------------------
+    ground:
+      use_ransac: true
+      band_min_z: -0.25
+      band_max_z: 0.25
+      max_tilt_deg: 8.0
+      ransac_dist_thresh: 0.025
+      ransac_max_iter: 200
+      min_inliers: 30
+      max_plane_offset: 0.20
+      nominal_z: 0.0
+      clearance_height: 0.045
+      level_to_ground: true
+
+    # -------------------------------------------------------------------------
+    # Edge-dragging ("veil") outlier suppression (ROR + per-cluster SOR)
+    # -------------------------------------------------------------------------
+    outlier:
+      ror_enabled: true
+      ror_radius: 0.06
+      ror_min_neighbors: 3
+      sor_enabled: true
+      sor_mean_k: 12
+      sor_stddev_mul: 2.5
+
+    # -------------------------------------------------------------------------
+    # PCL Euclidean clustering (separates cubes spaced >= 10 cm apart)
+    # -------------------------------------------------------------------------
+    cluster:
+      tolerance: 0.06
+      min_size: 25
+      max_size: 25000
+
+    # -------------------------------------------------------------------------
+    # Target box dimensions & calibrated material range offset
+    # -------------------------------------------------------------------------
+    box:
+      length: 0.35
+      width: 0.35
+      height: 0.35
+      range_bias_offset: 0.0  # Calibrated per surface material (meters)
+
+    # -------------------------------------------------------------------------
+    # Candidate cluster gating & oversized touching/stacked cluster rejection
+    # -------------------------------------------------------------------------
+    gate:
+      min_points: 35
+      min_xy_span: 0.18
+      max_xy_span: 0.50       # Touching cubes (~0.70 m) cleanly flagged & rejected
+      min_z: 0.20
+      max_z: 0.45             # Stacked cubes (~0.70 m) cleanly flagged & rejected
+      max_bottom_z: 0.25
+      height_consistency_tol: 0.07
+      min_inlier_ratio: 0.50
+      max_rmse: 0.040
+
+    # -------------------------------------------------------------------------
+    # Known-size 2-face L-shape & 1-face front-only Huber fitting
+    # -------------------------------------------------------------------------
+    fitting:
+      closeness_d0: 0.01
+      coarse_step_deg: 1.0
+      fine_step_deg: 0.1
+      top_band_thickness: 0.030
+      side_min_z: 0.05
+      side_top_margin: 0.045
+      top_min_points: 10
+      top_max_z_mad: 0.025
+      face_band: 0.035
+      two_face_min_span: 0.12
+      two_face_min_pts: 12
+      two_face_min_excl_span: 0.08
+      huber_delta: 0.015
+      ransac_line_iters: 100
+      ransac_line_thresh: 0.020
+      enable_se2_refine: true
+      se2_max_iters: 10
+      se2_max_shift: 0.04
+      se2_max_angle_deg: 6.0
+      inlier_dist_thresh: 0.030
+
+    # -------------------------------------------------------------------------
+    # Multi-object tracker (Hungarian + 6D KF + unwrapped yaw + hysteresis)
+    # -------------------------------------------------------------------------
+    tracker:
+      max_assoc_dist: 0.25
+      min_hits: 2
+      max_missed_frames: 3
+      kf_process_noise_pos: 0.020
+      kf_process_noise_vel: 0.80
+      kf_meas_noise_pos: 0.015
+      kf_vel_damping: 0.95
+      yaw_alpha: 0.45
+      switch_hysteresis_m: 0.15
+
+    # -------------------------------------------------------------------------
+    # Lock quality gating (/midtobox/locked)
+    # -------------------------------------------------------------------------
+    lock:
+      min_points: 80
+      min_inlier_ratio: 0.70
+      max_rmse: 0.025
+      window_frames: 3
+      max_pos_jitter: 0.015
+      max_yaw_jitter_deg: 3.0
+
+    # -------------------------------------------------------------------------
+    # Debug visualization
+    # -------------------------------------------------------------------------
+    debug:
+      publish_clouds: false
+      publish_roi_marker: true
