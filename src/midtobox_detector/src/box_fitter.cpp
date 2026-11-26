@@ -1,10 +1,10 @@
 // Copyright 2026 midtobox contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Known-size 3D cube geometric fitting from partial-view LiDAR point clusters.
-// Adapts Zhang IV 2017 L-shape closeness fitting (SS47816/lidar_obstacle_detector, MIT)
-// and known-size partial-view centroid correction (autoware_shape_estimation, Apache-2.0),
-// explicitly branching 2-face L-shape vs 1-face front-only to avoid corner-flip bias.
+// 已知尺寸 3D 方块单视角几何拟合实现。
+// 借鉴 Zhang IV 2017 L-shape Closeness 拟合（SS47816/lidar_obstacle_detector, MIT）
+// 与已知尺寸部分视角质心修正（autoware_shape_estimation, Apache-2.0），
+// 显式区分双立面 L 形与单立面正面分支，彻底消除单正面角点跳变偏置。
 
 #include "midtobox_detector/box_fitter.hpp"
 
@@ -37,7 +37,7 @@ inline double huberLoss(double residual, double delta)
   return delta * (a - 0.5 * delta);
 }
 
-// Fast O(N) quantile on a scratch copy (modifies buffer in place).
+// 基于临时数组原地计算 O(N) 线性插值分位数（会修改传入的 buf 顺序）
 double quantileInPlace(std::vector<double> & buf, double q)
 {
   if (buf.empty()) {
@@ -55,14 +55,14 @@ double quantileInPlace(std::vector<double> & buf, double q)
   if (hi == lo) {
     return v_lo;
   }
-  // Elements after lo are >= v_lo, so min_element in [lo+1, end) equals element at hi == lo+1.
+  // nth_element 保证 [lo+1, end) 均 >= v_lo，因此其中的最小值即为第 hi=lo+1 大元素
   const double v_hi = *std::min_element(
     buf.begin() + static_cast<std::ptrdiff_t>(lo + 1), buf.end());
   const double frac = pos - static_cast<double>(lo);
   return v_lo + frac * (v_hi - v_lo);
 }
 
-// Evaluate Zhang IV 2017 closeness criterion at angle theta (radians).
+// 评估给定角度 theta (rad) 下的 Zhang IV 2017 Closeness 贴合度得分（越大越贴合正交边缘）
 double evalCloseness(
   const std::vector<Eigen::Vector2d> & pts,
   double theta,
@@ -81,7 +81,7 @@ double evalCloseness(
     c2_buf[i] = -pts[i].x() * sn + pts[i].y() * cs;
   }
 
-  // Use 1% trimmed envelope to stay immune to isolated edge-dragging outliers
+  // 采用 1% 截断包络（p1/p99）替代裸 min/max，免疫孤立边缘拉丝飞点
   scratch = c1_buf;
   const double c1_min = quantileInPlace(scratch, 0.01);
   scratch = c1_buf;
@@ -102,8 +102,8 @@ double evalCloseness(
   return score;
 }
 
-// Fit a single 2D line n·p = d via deterministic RANSAC + Huber IRLS weighted PCA.
-// Normal `n_out` is oriented to satisfy n_out · (sensor_2d - mean) >= 0.
+// 用确定性 RANSAC + Huber IRLS 加权 PCA 拟合单条 2D 直线 n·p = d。
+// 输出法向量 n_out 统一指向雷达侧，即满足 n_out · (sensor_2d - mean) >= 0。
 bool fitSingleLineRansacHuber(
   const std::vector<Eigen::Vector2d> & pts,
   const Eigen::Vector2d & sensor_2d,
@@ -159,7 +159,7 @@ bool fitSingleLineRansacHuber(
     return false;
   }
 
-  // Collect candidate points near RANSAC line for Huber IRLS refinement
+  // 收集 RANSAC 直线附近的候选点，送入 Huber IRLS 做精细拟合
   std::vector<Eigen::Vector2d> inlier_pts;
   inlier_pts.reserve(n);
   const double refine_gate = std::max(cfg.ransac_line_thresh * 2.5, cfg.face_band);
@@ -172,7 +172,7 @@ bool fitSingleLineRansacHuber(
     inlier_pts = pts;
   }
 
-  // Huber IRLS via weighted 2x2 PCA
+  // 基于加权 2x2 PCA 的 Huber 迭代重加权最小二乘（IRLS）
   Eigen::Vector2d cur_n = best_n;
   double cur_d = best_d;
   std::vector<double> weights(inlier_pts.size(), 1.0);
@@ -210,7 +210,7 @@ bool fitSingleLineRansacHuber(
     }
   }
 
-  // Orient normal to point toward the sensor
+  // 统一将法向量定向到指向雷达一侧
   Eigen::Vector2d mean_pt = Eigen::Vector2d::Zero();
   for (const auto & p : inlier_pts) {
     mean_pt += p;
@@ -226,9 +226,8 @@ bool fitSingleLineRansacHuber(
   return true;
 }
 
-// Coupled orthogonal 2-line Huber IRLS refinement for 2-face L-shape corner estimation.
-// Optimizes (theta, d1', d2') such that n1(theta) = (cos theta, sin theta),
-// n2(theta) = s * (-sin theta, cos theta) with s in {-1, +1} preserving handedness.
+// 双立面 L 形耦合正交双线 Huber IRLS 联合精修（同时优化共享角度 theta 与两条边截距 d1', d2'）。
+// 强制 n1(theta) = (cos theta, sin theta) 与 n2(theta) = s * (-sin theta, cos theta) 严格正交。
 void refineTwoFaceOrthogonalHuber(
   const std::vector<Eigen::Vector2d> & pts,
   const Eigen::Vector2d & center_ref,
@@ -245,7 +244,7 @@ void refineTwoFaceOrthogonalHuber(
     const double sn = std::sin(theta);
     const Eigen::Vector2d n1(cs, sn);
     const Eigen::Vector2d n2(handedness * (-sn), handedness * cs);
-    // Exact derivatives: dn1/dtheta = handedness * n2, dn2/dtheta = -handedness * n1
+    // 精确解析导数：dn1/dtheta = handedness * n2, dn2/dtheta = -handedness * n1
     const Eigen::Vector2d dn1 = handedness * n2;
     const Eigen::Vector2d dn2 = -handedness * n1;
 
@@ -289,7 +288,7 @@ void refineTwoFaceOrthogonalHuber(
       break;
     }
 
-    // Clamp angular step per iteration for stability
+    // 限制单步角度增量，保证高斯牛顿收敛稳定
     const double dtheta = std::clamp(step(0), -0.15, 0.15);
     theta += dtheta;
     d1_rel += step(1);
@@ -301,8 +300,7 @@ void refineTwoFaceOrthogonalHuber(
   }
 }
 
-// Compute signed residual and world normal from 2D point p to nearest edge of box (c, theta, L, W).
-// Returns false if point is outside the max gating distance.
+// 计算 2D 点 p 到已知矩形盒 (c, theta, L, W) 最近边界的有符号残差与世界系外法向
 bool computePointToBoxEdge2D(
   const Eigen::Vector2d & p,
   const Eigen::Vector2d & c,
@@ -326,7 +324,7 @@ bool computePointToBoxEdge2D(
   const bool out_y = std::abs(ly) > half_w;
 
   if (!out_x && !out_y) {
-    // Inside box: snap to closest of the 4 edges
+    // 点落在矩形内部：吸附到距离最近的 4 条边之一
     const double dx_pos = half_l - lx;
     const double dx_neg = lx + half_l;
     const double dy_pos = half_w - ly;
@@ -368,7 +366,7 @@ bool computePointToBoxEdge2D(
     return true;
   }
 
-  // Corner region: outside both X and Y
+  // 角点外区域：X 与 Y 方向同时超出矩形边界
   const double sx = (lx >= 0.0) ? 1.0 : -1.0;
   const double sy = (ly >= 0.0) ? 1.0 : -1.0;
   const double ex = lx - sx * half_l;
@@ -384,8 +382,8 @@ bool computePointToBoxEdge2D(
   return true;
 }
 
-// Pure 2D SE(2) Huber point-to-edge refinement with damped Gauss-Newton.
-// For 1-face fits, applies a soft lateral anchor along `tangent_anchor` to prevent unconstrained sliding.
+// 纯 2D SE(2) Huber 点到边阻尼高斯牛顿精修（绝不引入 Z 轴翻转）。
+// 在单立面模式下，沿正面切向 `tangent_anchor` 施加软锚定约束，防止沿切线方向无约束滑动。
 void refineBoxSE2Huber(
   const std::vector<Eigen::Vector2d> & side_pts,
   double half_l,
@@ -492,7 +490,7 @@ void refineBoxSE2Huber(
   theta_io = cur_th;
 }
 
-// Evaluate 3D distance from a point to the surface of a 3D box centered at `c` with yaw `theta`.
+// 计算 3D 点 p 到中心在 c、偏航角 theta 的 3D 长方体 6 个外表面的最短欧氏距离
 double pointToBoxSurface3D(
   const Eigen::Vector3d & p,
   const Eigen::Vector3d & c,
@@ -605,7 +603,7 @@ double BoxFitter::searchLShapeOrientation(
   double best_theta = 0.0;
   double best_score = -1.0;
 
-  // Coarse search over [0, pi/2)
+  // 阶段 1：在 [0, pi/2) 区间做粗步长全局搜索
   for (double th = 0.0; th < kHalfPi - 1e-6; th += coarse_step) {
     const double score = evalCloseness(pts, th, d0, c1_buf, c2_buf, scratch);
     if (score > best_score) {
@@ -614,7 +612,7 @@ double BoxFitter::searchLShapeOrientation(
     }
   }
 
-  // Fine search around coarse winner
+  // 阶段 2：在粗搜最优角度附近做 0.1° 级精细搜索
   const double fine_window = 1.5 * coarse_step;
   const double start_th = best_theta - fine_window;
   const double end_th = best_theta + fine_window;
@@ -626,7 +624,7 @@ double BoxFitter::searchLShapeOrientation(
     }
   }
 
-  // Wrap into [0, pi/2)
+  // 将结果归约到 [0, pi/2)
   best_theta = std::fmod(best_theta, kHalfPi);
   if (best_theta < 0.0) {
     best_theta += kHalfPi;
@@ -648,7 +646,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     return false;
   }
 
-  // 1. Split candidate upper-band vs side-face points in ground-leveled frame G (z = 0 is ground)
+  // 1. 在地面整平系 G（z = 0 为地面）中分离顶部候选带与侧面立面点
   std::vector<double> z_vals;
   z_vals.reserve(cluster_pts.size());
   for (const auto & p : cluster_pts) {
@@ -657,7 +655,7 @@ bool BoxFitter::fitBoxInGroundFrame(
   std::vector<double> z_copy = z_vals;
   const double z_p97 = quantileInPlace(z_copy, 0.97);
 
-  // 2. Symmetric early height consistency gate against known box height H
+  // 2. 对称早期高度一致性校验：即使无顶面可见，也能拒判过矮/过高的干扰物体
   const double min_expected_z =
     std::max(gate_cfg.min_z, cfg.height - gate_cfg.height_consistency_tol);
   const double max_expected_z = cfg.height + gate_cfg.height_consistency_tol;
@@ -683,7 +681,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     }
   }
 
-  // Fallback if side band was too sparse (e.g. near-overhead view)
+  // 若侧面带点过少（例如极近距俯视视角），回退使用整簇点做 2D 拟合
   if (side_pts_2d.size() < 15) {
     side_pts_2d.clear();
     side_pts_2d.reserve(cluster_pts.size());
@@ -692,12 +690,12 @@ bool BoxFitter::fitBoxInGroundFrame(
     }
   }
 
-  // 3. Zhang IV 2017 L-shape closeness search on 2D side points
+  // 3. 对侧面 2D 点云执行 Zhang IV 2017 L-shape Closeness 朝向搜索
   const double theta0 = searchLShapeOrientation(side_pts_2d, cfg);
   const Eigen::Vector2d e1(std::cos(theta0), std::sin(theta0));
   const Eigen::Vector2d e2(-std::sin(theta0), std::cos(theta0));
 
-  // Robust cluster 2D center for sensor-facing normal orientation
+  // 用中位数求鲁棒 2D 中心，辅助确定指向雷达侧的外法向符号
   std::vector<double> sx_vals;
   std::vector<double> sy_vals;
   sx_vals.reserve(side_pts_2d.size());
@@ -713,13 +711,13 @@ bool BoxFitter::fitBoxInGroundFrame(
   const Eigen::Vector2d to_sensor = sensor_2d - med_2d;
   const double to_sensor_norm = std::max(to_sensor.norm(), 1e-6);
 
-  // Orient orthogonal face normals (n1, n2) to point into the half-space facing the sensor
+  // 将两条正交轴法向量 (n1, n2) 统一指向朝向雷达的半空间
   const double sgn1 = (to_sensor.dot(e1) >= 0.0) ? 1.0 : -1.0;
   const double sgn2 = (to_sensor.dot(e2) >= 0.0) ? 1.0 : -1.0;
   const Eigen::Vector2d n1_init = sgn1 * e1;
   const Eigen::Vector2d n2_init = sgn2 * e2;
 
-  // Project side points into sensor-facing (u, v) coordinates
+  // 将侧面点投影到朝向雷达的 (u, v) 坐标系下，统计各立面跨度与独有点数量
   std::vector<double> u_vals(side_pts_2d.size());
   std::vector<double> v_vals(side_pts_2d.size());
   for (size_t i = 0; i < side_pts_2d.size(); ++i) {
@@ -740,7 +738,7 @@ bool BoxFitter::fitBoxInGroundFrame(
   const double span_u = u_max - u_min;
   const double span_v = v_max - v_min;
 
-  // Count exclusive points on each visible face away from the corner
+  // 统计远离公共角点、明确归属于面 1 与面 2 的独有点（避免角点噪声误判双面）
   std::vector<double> excl_f1_v;
   std::vector<double> excl_f2_u;
   excl_f1_v.reserve(side_pts_2d.size());
@@ -773,7 +771,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     excl_f2_span = hi - lo;
   }
 
-  // Require both faces to genuinely face the sensor (incidence < ~85 deg, cos > 0.085)
+  // 两立面必须同时处于面向雷达的有效入射角内（入射角 < ~85°，cos > 0.085）
   const double cos1 = n1_init.dot(to_sensor) / to_sensor_norm;
   const double cos2 = n2_init.dot(to_sensor) / to_sensor_norm;
 
@@ -795,14 +793,14 @@ bool BoxFitter::fitBoxInGroundFrame(
   Eigen::Vector2d bias_push_vec = Eigen::Vector2d::Zero();
 
   if (is_two_face) {
-    // 4A. Two-Face L-Shape Branch: coupled orthogonal Huber IRLS -> corner + L/2 inward push
+    // 4A. 双立面 L 形分支：耦合正交双线 Huber IRLS 求精确角点 -> 沿两内法向各推进 L/2、W/2
     fit_mode = FitMode::kTwoFaceLShape;
     double th_n1 = std::atan2(n1_init.y(), n1_init.x());
-    // Handedness s in {-1, +1} such that n2 = s * (-sin(th_n1), cos(th_n1))
+    // 记录手性符号 s ∈ {-1, +1}，使 n2 = s * (-sin(th_n1), cos(th_n1))
     const Eigen::Vector2d rot90_n1(-n1_init.y(), n1_init.x());
     const double handedness = (n2_init.dot(rot90_n1) >= 0.0) ? 1.0 : -1.0;
 
-    // Initialize d1_rel, d2_rel using median of exclusive face points relative to med_2d
+    // 用两面各自独有点的投影中位数初始化相对截距 d1_rel, d2_rel
     std::vector<double> f1_proj;
     std::vector<double> f2_proj;
     for (size_t i = 0; i < side_pts_2d.size(); ++i) {
@@ -825,11 +823,10 @@ bool BoxFitter::fitBoxInGroundFrame(
     const Eigen::Vector2d n1(std::cos(th_n1), std::sin(th_n1));
     const Eigen::Vector2d n2(handedness * (-std::sin(th_n1)), handedness * std::cos(th_n1));
 
-    // Match dimensions (L along n1, W along n2) when non-square
+    // 若目标为长方形（L != W），按实测跨度自动匹配哪条法向对应长边 L、哪条对应宽边 W
     double dim_n1 = cfg.length;
     double dim_n2 = cfg.width;
     if (std::abs(cfg.length - cfg.width) > 0.02) {
-      // Face 1 spans along n2 (width dim_n2); Face 2 spans along n1 (length dim_n1)
       const double err_keep = std::abs(span_v - cfg.width) + std::abs(span_u - cfg.length);
       const double err_swap = std::abs(span_v - cfg.length) + std::abs(span_u - cfg.width);
       if (err_swap < err_keep) {
@@ -842,7 +839,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     c_2d = p_corner - 0.5 * dim_n1 * n1 - 0.5 * dim_n2 * n2;
     bias_push_vec = -(n1 + n2);
 
-    // Box x-axis aligned with length dimension
+    // 将方块局部 X 轴对齐到长度方向 L
     if (std::abs(dim_n1 - cfg.length) <= std::abs(dim_n2 - cfg.length)) {
       box_yaw = std::atan2(n1.y(), n1.x());
     } else {
@@ -851,9 +848,9 @@ bool BoxFitter::fitBoxInGroundFrame(
     box_l = cfg.length;
     box_w = cfg.width;
   } else {
-    // 4B. Single-Face Front-Only Branch:
-    // RANSAC + Huber line normal push -(L/2 + range_bias) + symmetric p5/p95 lateral midpoint.
-    // Eliminates Autoware's single-face corner-flip bias!
+    // 4B. 单立面正面分支：
+    // RANSAC + Huber 拟合正面外法向，切向取对称 p5/p95 中点，沿 -n_front 推进半边长。
+    // 彻底避开 Autoware 单面锚定最近角点带来的左右跳变与横向偏置问题！
     fit_mode = FitMode::kSingleFace;
     Eigen::Vector2d n_front;
     double d_front = 0.0;
@@ -865,7 +862,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     const Eigen::Vector2d t_front(-n_front.y(), n_front.x());
     tangent_anchor = t_front;
 
-    // Project front-face inliers onto tangent axis for symmetric p5/p95 lateral midpoint
+    // 将正面内点投影到切线方向，用 p5/p95 对称中点定位正面中心
     std::vector<double> tau_vals;
     tau_vals.reserve(side_pts_2d.size());
     for (const auto & p : side_pts_2d) {
@@ -886,7 +883,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     const double tau_mid = 0.5 * (tau_lo + tau_hi);
     const double tau_span = tau_hi - tau_lo;
 
-    // Choose depth dimension for non-square boxes based on observed front width
+    // 若为长方形，根据正面观测宽度推断沿视线纵深方向的边长
     double depth_dim = cfg.length;
     if (std::abs(cfg.length - cfg.width) > 0.02) {
       if (std::abs(tau_span - cfg.length) < std::abs(tau_span - cfg.width)) {
@@ -906,7 +903,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     box_l = cfg.length;
     box_w = cfg.width;
 
-    // Optional upper-surface depth cross-validation: verify upper points do not extend far behind front face
+    // 顶部纵深交叉校验：若顶部点云向后延伸远超已知块深，则拒判为前后粘连超大目标
     if (static_cast<int>(top_pts_2d.size()) >= cfg.top_min_points) {
       std::vector<double> top_depth;
       top_depth.reserve(top_pts_2d.size());
@@ -914,7 +911,6 @@ bool BoxFitter::fitBoxInGroundFrame(
         top_depth.push_back(d_front - tp.dot(n_front));
       }
       const double top_far = quantileInPlace(top_depth, 0.95);
-      // If upper surface extends dramatically deeper than expected box depth, reject oversized
       if (top_far > depth_dim + 0.16) {
         reject_reason = "top_depth_oversized";
         return false;
@@ -922,7 +918,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     }
   }
 
-  // 5. Optional pure 2D SE(2) Huber point-to-edge refinement (on measured surface geometry)
+  // 5. 可选纯 2D SE(2) Huber 点到边联合精修（在实测表面几何上微调中心与偏航角）
   if (cfg.enable_se2_refine) {
     refineBoxSE2Huber(
       side_pts_2d,
@@ -935,15 +931,15 @@ bool BoxFitter::fitBoxInGroundFrame(
       box_yaw);
   }
 
-  // Canonicalize yaw (4-fold [-45, +45) for square, 2-fold [-90, +90) for rectangle)
+  // 对称偏航角归约：正方形归约到 [-45°, +45°)，长方形归约到 [-90°, +90°)
   const bool is_square = std::abs(box_l - box_w) < 0.02;
   const double sym_period = is_square ? kHalfPi : kPi;
   box_yaw = canonicalizeSymmetricYaw(box_yaw, sym_period);
 
-  // 5b. Authoritative top-face detection & cz estimation using strictly interior points
-  // inset from all 4 side walls. Eliminates both:
-  //   (1) false top-face triggers on upright 2-face L-shape views (zero actual top points), and
-  //   (2) downward Z bias from dense upper side-wall points contaminating the top Z band.
+  // 5b. 权威顶面判定与质心高度 cz 解算：
+  // 仅取严格内缩于四壁内部的顶部点，彻底解决：
+  //   (1) 正装双面 L 形在无任何顶面点时误触发顶面判定的问题；
+  //   (2) 侧壁上沿高密度点混入顶部带导致 cz 稳定偏低 1.5~2 cm 的系统偏差。
   const double half_l = 0.5 * box_l;
   const double half_w = 0.5 * box_w;
   const double half_h = 0.5 * cfg.height;
@@ -1004,7 +1000,7 @@ bool BoxFitter::fitBoxInGroundFrame(
     }
   }
 
-  // 6. Compute 3D surface inlier ratio and RMSE against measured surface geometry
+  // 6. 在实测表面几何上评估 3D 箱面内点率与均方根误差 (RMSE)
   const Eigen::Vector3d center_geom(c_2d.x(), c_2d.y(), cz);
 
   int inlier_count = 0;
@@ -1031,9 +1027,8 @@ bool BoxFitter::fitBoxInGroundFrame(
     return false;
   }
 
-  // Apply material-calibrated range bias offset after geometric surface fit & quality checks.
-  // For 2-face L-shape views, a radial range shift translates both orthogonal faces along the
-  // sensor-to-box ray, moving the fitted corner along -u_ray (unit vector, NOT -(n1+n2)).
+  // 7. 施加针对材质反射率标定的系统测距偏置补偿 range_bias_offset。
+  // 双立面 L 形下，径向测距偏置会沿雷达->方块单位射线方向整体平移两正交面（不能用 -(n1+n2) 否则放大 √2 倍）。
   if (fit_mode == FitMode::kTwoFaceLShape) {
     const Eigen::Vector2d ray_2d = c_2d - sensor_2d;
     const double ray_norm = ray_2d.norm();
@@ -1045,7 +1040,7 @@ bool BoxFitter::fitBoxInGroundFrame(
   }
   const Eigen::Vector2d c_2d_final = c_2d + cfg.range_bias_offset * bias_push_vec;
 
-  // Populate detection in ground-leveled frame G
+  // 汇总填充地面整平系 G 下的单帧检测结果
   detection_ground.center = Eigen::Vector3d(c_2d_final.x(), c_2d_final.y(), cz);
   detection_ground.yaw = box_yaw;
   detection_ground.orientation =
@@ -1059,7 +1054,7 @@ bool BoxFitter::fitBoxInGroundFrame(
   detection_ground.inlier_ratio = inlier_ratio;
   detection_ground.rmse = rmse;
 
-  // Composite confidence score in [0, 1]
+  // 计算综合置信度得分 ∈ [0, 1]（双立面观测稳定性略高于单立面）
   const double pts_factor = std::min(1.0, static_cast<double>(cluster_pts.size()) / 150.0);
   const double rmse_factor = std::exp(-rmse / 0.025);
   const double mode_bonus = (fit_mode == FitMode::kTwoFaceLShape) ? 1.0 : 0.92;

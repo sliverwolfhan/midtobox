@@ -148,52 +148,52 @@ midtobox_detector:
     # 【二、进阶算法参数区】一般保持默认即可，仅在精细调优时修改
     # =========================================================================
 
-    # 11. 边缘拉丝飞点滤波（ROR + 每簇 SOR）
+    # 11. 边缘拉丝飞点滤波（ROR 粗去桥接拉丝 + 每簇 SOR 精去边角飞点）
     outlier:
-      ror_enabled: true
-      ror_radius: 0.06
-      ror_min_neighbors: 3
-      sor_enabled: true
-      sor_mean_k: 12
-      sor_stddev_mul: 2.5
+      ror_enabled: true                  # 是否启用半径离群滤波（聚类前执行，断开粘连飞点）
+      ror_radius: 0.06                   # 邻居搜索半径 (m)
+      ror_min_neighbors: 3               # 半径内最少邻居点数（低于此值视为孤立飞点剔除）
+      sor_enabled: true                  # 是否启用统计离群滤波（每簇独立执行，修剪拉丝拖尾）
+      sor_mean_k: 12                     # 统计最近邻个数 K
+      sor_stddev_mul: 2.5                # 标准差倍率阈值（过小会误删斜视角稀疏顶面点，建议 >=2.2）
 
     # 12. PCL 欧氏聚类（分离间距 >= 10 cm 的独立块）
     cluster:
-      tolerance: 0.06
-      min_size: 25
-      max_size: 25000
+      tolerance: 0.06                    # 欧氏聚类连通半径 (m，需小于两块最小间隔 0.10 m)
+      min_size: 25                       # 单个簇最少点数（过滤零星杂点）
+      max_size: 25000                    # 单个簇最多点数（防止大墙面拖慢计算）
 
     # 13. 已知尺寸 L-shape / 单正面 / 2D SE(2) Huber 拟合内部阈值
     fitting:
-      closeness_d0: 0.01
-      coarse_step_deg: 1.0
-      fine_step_deg: 0.1
-      top_band_thickness: 0.030
-      side_min_z: 0.05
-      side_top_margin: 0.045
-      top_min_points: 10
-      top_max_z_mad: 0.025
-      face_band: 0.035
-      two_face_min_span: 0.12
-      two_face_min_pts: 12
-      two_face_min_excl_span: 0.08
-      huber_delta: 0.015
-      ransac_line_iters: 100
-      ransac_line_thresh: 0.020
-      enable_se2_refine: true
-      se2_max_iters: 10
-      se2_max_shift: 0.04
-      se2_max_angle_deg: 6.0
-      inlier_dist_thresh: 0.030
+      closeness_d0: 0.01                 # Zhang IV 2017 Closeness 准则最小距离下限 d0 (m)
+      coarse_step_deg: 1.0               # L-shape 粗搜索角度步长 (deg，范围 [0°, 90°))
+      fine_step_deg: 0.1                 # L-shape 精搜索角度步长 (deg，在粗搜最优值附近细搜)
+      top_band_thickness: 0.030          # 顶部候选带厚度 (m，从 z_p97 向下截取)
+      side_min_z: 0.05                   # 侧面点最小离地高度 (m，避开地面残余噪点)
+      side_top_margin: 0.045             # 侧面点距顶面留白 (m，避开顶面圆角/混合像素)
+      top_min_points: 10                 # 确认存在真实顶面所需的最少内缩顶面点数
+      top_max_z_mad: 0.025               # 顶面高度中位绝对偏差 (MAD) 上限 (m)，判断顶面是否平整
+      face_band: 0.035                   # 归属到单个立面的距离带宽度 (m)
+      two_face_min_span: 0.12            # 判定为双立面 L 形时，两正交轴方向各自最小跨度 (m)
+      two_face_min_pts: 12               # 判定为双立面 L 形时，每面独有点（远离角点）最少点数
+      two_face_min_excl_span: 0.08       # 判定为双立面 L 形时，每面独有点的最小延伸跨度 (m)
+      huber_delta: 0.015                 # Huber 鲁棒损失拐点 (m，超过此残差转为线性降权抗飞点)
+      ransac_line_iters: 100             # 单立面 RANSAC 直线拟合最大迭代次数
+      ransac_line_thresh: 0.020          # 单立面 RANSAC 内点距离阈值 (m)
+      enable_se2_refine: true            # 是否开启纯 2D SE(2) Huber 点到边高斯牛顿精修
+      se2_max_iters: 10                  # SE(2) 精修最大迭代次数
+      se2_max_shift: 0.04                # SE(2) 精修相对初值允许的最大平移量 (m)
+      se2_max_angle_deg: 6.0             # SE(2) 精修相对初值允许的最大旋转量 (deg)
+      inlier_dist_thresh: 0.030          # 计算 3D 表面内点比例与 RMSE 时的点到箱面距离阈值 (m)
 
-    # 14. 多目标跟踪（匈牙利匹配 + 6D 卡尔曼滤波 + 主目标滞回）
+    # 14. 多目标跟踪（匈牙利匹配 + 6D 卡尔曼滤波 + 主目标滞回防抖）
     tracker:
-      max_assoc_dist: 0.25
-      min_hits: 2
-      max_missed_frames: 3
-      kf_process_noise_pos: 0.020
-      kf_process_noise_vel: 0.80
-      kf_meas_noise_pos: 0.015
-      kf_vel_damping: 0.95
-      yaw_alpha: 0.45
-      switch_hysteresis_m: 0.15
+      max_assoc_dist: 0.25               # 帧间匈牙利匹配最大关联距离 (m)
+      min_hits: 2                        # 连续命中多少帧才确认为有效目标（滤除单帧误检）
+      max_missed_frames: 3               # 连续丢失多少帧后销毁该跟踪轨迹
+      kf_process_noise_pos: 0.020        # 卡尔曼位置过程噪声标准差 (m)
+      kf_process_noise_vel: 0.80         # 卡尔曼速度过程噪声标准差 (m/s)
+      kf_meas_noise_pos: 0.015           # 卡尔曼观测位置噪声标准差 (m)
+      kf_vel_damping: 0.95               # 速度衰减系数（<1 防止静止方块因残余速度过冲）
+      yaw_alpha: 0.45                    # 偏航角指数滑动平均系数 (0~1，越大响应越快、平滑越弱)
+      switch_hysteresis_m: 0.15          # 主目标切换滞回距离 (m，新块须比当前主目标近此值才切换)

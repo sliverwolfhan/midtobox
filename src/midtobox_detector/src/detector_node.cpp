@@ -1,7 +1,7 @@
 // Copyright 2026 midtobox contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// ROS 2 Humble node implementation for midtobox_detector.
+// midtobox_detector ROS 2 Humble 感知节点实现。
 
 #include "midtobox_detector/detector_node.hpp"
 
@@ -71,7 +71,7 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
     publishStaticLidarTf();
   }
 
-  // Output publishers (RELIABLE for downstream consumers and RViz)
+  // 输出话题发布器（采用 RELIABLE 可靠传输，方便下游控制与 RViz 稳定接收）
   const auto reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable().durability_volatile();
   target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
     target_pose_topic_, reliable_qos);
@@ -90,8 +90,7 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
       debug_nonground_topic_, debug_qos);
   }
 
-  // Sensor subscription QoS: BEST_EFFORT subscribes cleanly to both RELIABLE (livox_ros_driver2)
-  // and BEST_EFFORT (SensorDataQoS / sim / bag) publishers under DDS RxO rules.
+  // 传感器订阅 QoS：DDS RxO 规则下 BEST_EFFORT 可同时兼容 RELIABLE(驱动) 与 BEST_EFFORT(仿真/bag)
   rclcpp::QoS sub_qos = rclcpp::QoS(rclcpp::KeepLast(20)).durability_volatile();
   if (qos_reliability_ == "reliable") {
     sub_qos.reliable();
@@ -131,7 +130,7 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
       input_topic_.c_str(), qos_reliability_.c_str());
   }
 
-  // Enable live parameter tuning via `ros2 param set` after startup declaration completes
+  // 启动参数声明完成后再注册动态回调，支持运行期用 ros2 param set 实时热调参
   param_cb_handle_ = this->add_on_set_parameters_callback(
     std::bind(&MidtoboxDetectorNode::onParametersSet, this, std::placeholders::_1));
 
@@ -151,7 +150,7 @@ MidtoboxDetectorNode::MidtoboxDetectorNode(const rclcpp::NodeOptions & options)
 
 void MidtoboxDetectorNode::declareAndLoadParameters()
 {
-  // IO, topics & frames (defaults sourced from member initializers / config_types.hpp)
+  // 1. 输入/输出话题与坐标系配置（兜底默认值取自成员变量 / config_types.hpp）
   input_topic_ = this->declare_parameter<std::string>("input_topic", input_topic_);
   input_format_ = this->declare_parameter<std::string>("input_format", input_format_);
   qos_reliability_ = this->declare_parameter<std::string>("qos_reliability", qos_reliability_);
@@ -177,7 +176,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
     this->declare_parameter<std::string>("output_frame", output_frame_));
   publish_static_tf_ = this->declare_parameter<bool>("publish_static_tf", publish_static_tf_);
 
-  // Mounting
+  // 2. 雷达安装外参
   mounting_cfg_.inverted =
     this->declare_parameter<bool>("mounting.inverted", mounting_cfg_.inverted);
   mounting_cfg_.x = this->declare_parameter<double>("mounting.x", mounting_cfg_.x);
@@ -191,7 +190,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
     this->declare_parameter<double>("mounting.yaw_deg", mounting_cfg_.yaw_deg);
   T_base_lidar_ = mounting_cfg_.computeTransform();
 
-  // Sliding window
+  // 3. 滑动窗口累积
   window_duration_sec_ =
     this->declare_parameter<double>("window.duration_sec", window_duration_sec_);
   window_max_frames_ = this->declare_parameter<int>("window.max_frames", window_max_frames_);
@@ -200,7 +199,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   storage_roi_padding_ =
     this->declare_parameter<double>("window.storage_roi_padding", storage_roi_padding_);
 
-  // Pre-filter (Mid-360 tag & range)
+  // 4. Mid-360 原始点云预过滤（tag 掩码与距离门控）
   prefilter_cfg_.min_range =
     this->declare_parameter<double>("prefilter.min_range", prefilter_cfg_.min_range);
   prefilter_cfg_.max_range =
@@ -213,7 +212,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
 
   PipelineConfig cfg;
 
-  // Ego crop & workspace ROI
+  // 5. 自车剔除盒与作业区 ROI
   cfg.crop.ego_enabled =
     this->declare_parameter<bool>("crop.ego_enabled", cfg.crop.ego_enabled);
   cfg.crop.ego_min_x = this->declare_parameter<double>("crop.ego_min_x", cfg.crop.ego_min_x);
@@ -231,7 +230,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   cfg.crop.voxel_leaf_size =
     this->declare_parameter<double>("crop.voxel_leaf_size", cfg.crop.voxel_leaf_size);
 
-  // Ground segmentation
+  // 6. 地面分割与整平
   cfg.ground.use_ransac =
     this->declare_parameter<bool>("ground.use_ransac", cfg.ground.use_ransac);
   cfg.ground.band_min_z =
@@ -255,7 +254,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   cfg.ground.level_to_ground =
     this->declare_parameter<bool>("ground.level_to_ground", cfg.ground.level_to_ground);
 
-  // Outlier removal
+  // 7. 边缘拉丝离群滤波（ROR + SOR）
   cfg.outlier.ror_enabled =
     this->declare_parameter<bool>("outlier.ror_enabled", cfg.outlier.ror_enabled);
   cfg.outlier.ror_radius =
@@ -269,13 +268,13 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   cfg.outlier.sor_stddev_mul =
     this->declare_parameter<double>("outlier.sor_stddev_mul", cfg.outlier.sor_stddev_mul);
 
-  // Clustering
+  // 8. 欧氏聚类
   cfg.cluster.tolerance =
     this->declare_parameter<double>("cluster.tolerance", cfg.cluster.tolerance);
   cfg.cluster.min_size = this->declare_parameter<int>("cluster.min_size", cfg.cluster.min_size);
   cfg.cluster.max_size = this->declare_parameter<int>("cluster.max_size", cfg.cluster.max_size);
 
-  // Size & quality gates
+  // 9. 尺寸与质量门控
   cfg.gate.min_points = this->declare_parameter<int>("gate.min_points", cfg.gate.min_points);
   cfg.gate.min_xy_span = this->declare_parameter<double>("gate.min_xy_span", cfg.gate.min_xy_span);
   cfg.gate.max_xy_span = this->declare_parameter<double>("gate.max_xy_span", cfg.gate.max_xy_span);
@@ -289,7 +288,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
     this->declare_parameter<double>("gate.min_inlier_ratio", cfg.gate.min_inlier_ratio);
   cfg.gate.max_rmse = this->declare_parameter<double>("gate.max_rmse", cfg.gate.max_rmse);
 
-  // Box dimensions & fitting
+  // 10. 方块尺寸与几何拟合参数
   cfg.fitting.length = this->declare_parameter<double>("box.length", cfg.fitting.length);
   cfg.fitting.width = this->declare_parameter<double>("box.width", cfg.fitting.width);
   cfg.fitting.height = this->declare_parameter<double>("box.height", cfg.fitting.height);
@@ -337,7 +336,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   cfg.fitting.inlier_dist_thresh = this->declare_parameter<double>(
     "fitting.inlier_dist_thresh", cfg.fitting.inlier_dist_thresh);
 
-  // Tracker & lock gating
+  // 11. 多目标跟踪与锁定判据
   cfg.tracker.max_assoc_dist =
     this->declare_parameter<double>("tracker.max_assoc_dist", cfg.tracker.max_assoc_dist);
   cfg.tracker.min_hits = this->declare_parameter<int>("tracker.min_hits", cfg.tracker.min_hits);
@@ -369,7 +368,7 @@ void MidtoboxDetectorNode::declareAndLoadParameters()
   cfg.tracker.lock_max_yaw_jitter_deg = this->declare_parameter<double>(
     "lock.max_yaw_jitter_deg", cfg.tracker.lock_max_yaw_jitter_deg);
 
-  // Debug
+  // 12. 可视化与调试开关
   debug_publish_clouds_ =
     this->declare_parameter<bool>("debug.publish_clouds", debug_publish_clouds_);
   debug_publish_roi_marker_ =
@@ -401,7 +400,7 @@ rcl_interfaces::msg::SetParametersResult MidtoboxDetectorNode::onParametersSet(
   for (const auto & p : params) {
     const std::string & name = p.get_name();
 
-    // Startup-only parameters (subscriptions, publishers, static frame names)
+    // 启动项参数（涉及订阅/发布器重建或基础坐标系名），运行期禁止热修改
     if (name == "input_topic" || name == "input_format" || name == "qos_reliability" ||
         name == "base_frame" || name == "lidar_frame" || name == "odom_frame" ||
         name == "publish_static_tf" || name == "debug.publish_clouds" ||
@@ -650,7 +649,7 @@ rcl_interfaces::msg::SetParametersResult MidtoboxDetectorNode::onParametersSet(
     }
   }
 
-  // Commit atomically
+  // 全部参数校验通过后原子提交，外参变化时同步重发静态 TF 并清空滑窗历史
   pipeline_.setConfig(next_cfg);
   mounting_cfg_ = next_mounting;
   prefilter_cfg_ = next_prefilter;
@@ -895,7 +894,7 @@ bool MidtoboxDetectorNode::lookupOdomToBase(
     T_odom_base_out = tf2::transformToEigen(tf.transform);
     return true;
   } catch (const tf2::ExtrapolationException &) {
-    // Allow very recent latest TF if lidar timestamp leads odom slightly
+    // 雷达时间戳略超前于 odom 时，允许使用延迟在 odom_tf_max_age_sec_ 以内的最新一帧 TF
     try {
       const auto tf = tf_buffer_->lookupTransform(
         odom_frame_, base_frame_, tf2::TimePointZero);
@@ -954,7 +953,7 @@ bool MidtoboxDetectorNode::lookupBaseToOutput(
     try {
       const auto tf = tf_buffer_->lookupTransform(
         output_frame_, base_frame_, tf2::TimePointZero);
-      // Reject stale dynamic transforms (static transforms have stamp == 0)
+      // 拒绝过期的动态 TF（静态 TF 的时间戳固定为 0，不受超时限制）
       if (tf.header.stamp.sec != 0 || tf.header.stamp.nanosec != 0) {
         const rclcpp::Time tf_time(tf.header.stamp, stamp.get_clock_type());
         const double age = std::abs((stamp - tf_time).seconds());
@@ -999,7 +998,7 @@ void MidtoboxDetectorNode::processSensorCloud(
   }
   const double stamp_sec = stamp.seconds();
 
-  // Check timestamp monotonicity before buffering
+  // 入滑窗前先校验时间戳单调性：大跳变重置状态，小幅乱序帧直接丢弃
   if (!window_buffer_.empty()) {
     const double dt_last = stamp_sec - window_buffer_.back().stamp_sec;
     if (dt_last < -0.5 || dt_last > 2.0) {
@@ -1014,7 +1013,7 @@ void MidtoboxDetectorNode::processSensorCloud(
     }
   }
 
-  // 1. Transform sensor cloud into leveled base_footprint FIRST
+  // 1. 先将传感器点云整平变换到 base_footprint（倒装雷达必须在一切裁剪/去地前完成整平）
   Eigen::Isometry3d T_base_sensor = Eigen::Isometry3d::Identity();
   if (!lookupSensorToBase(header.frame_id, stamp, T_base_sensor)) {
     return;
@@ -1023,7 +1022,7 @@ void MidtoboxDetectorNode::processSensorCloud(
   const Eigen::Matrix3f R_bs = T_base_sensor.linear().cast<float>();
   const Eigen::Vector3f t_bs = T_base_sensor.translation().cast<float>();
 
-  // Pre-crop with generous padding before buffering in sliding window
+  // 滑窗入队前先按外扩余量做粗裁剪，节省内存与拷贝开销
   const auto & cc = pipeline_.config().crop;
   const float pad = static_cast<float>(std::max(storage_roi_padding_, 0.2));
   const float min_x = static_cast<float>(cc.roi_min_x) - pad;
@@ -1044,9 +1043,8 @@ void MidtoboxDetectorNode::processSensorCloud(
   frame_base->points.reserve(sensor_cloud->size() / 2);
   for (const auto & pt : sensor_cloud->points) {
     const Eigen::Vector3f pb = R_bs * Eigen::Vector3f(pt.x, pt.y, pt.z) + t_bs;
-    // Strip ego-vehicle / arm envelope in each scan's own base_footprint(t_k) BEFORE
-    // sliding-window odom motion compensation so backing up or turning never projects
-    // past self-body points into the workspace ROI as phantom obstacles.
+    // 在进入滑窗运动补偿前，必须先于各自时刻的 base_footprint(t_k) 内挖空自车/机械臂包络，
+    // 否则倒车或转向补偿时会把历史自车点投射到前方 ROI 中形成“自车鬼影”误检！
     if (cc.ego_enabled &&
         pb.x() >= ego_min_x && pb.x() <= ego_max_x &&
         pb.y() >= ego_min_y && pb.y() <= ego_max_y &&
@@ -1065,8 +1063,7 @@ void MidtoboxDetectorNode::processSensorCloud(
   frame_base->height = 1;
   frame_base->is_dense = true;
 
-  // 2. Sliding-window accumulation (with automatic odom->base_footprint motion compensation
-  //    or graceful static fallback)
+  // 2. 滑动窗口累积（有 odom->base_footprint TF 自动运动补偿，无 odom 时平滑退化为静止累积）
   Eigen::Isometry3d T_odom_base = Eigen::Isometry3d::Identity();
   const bool has_odom = lookupOdomToBase(stamp, T_odom_base);
   if (!odom_mode_logged_ || has_odom != last_odom_available_) {
@@ -1117,7 +1114,7 @@ void MidtoboxDetectorNode::processSensorCloud(
   } else {
     for (const auto & f : window_buffer_) {
       if (f.has_odom) {
-        // Avoid smearing previously motion-tracked frames uncompensated after odom dropout
+        // odom 中断时禁止把此前带运动的帧未经补偿直接拼入静止窗口，防止点云拖影
         continue;
       }
       accum_cloud->points.insert(
@@ -1128,7 +1125,7 @@ void MidtoboxDetectorNode::processSensorCloud(
   accum_cloud->height = 1;
   accum_cloud->is_dense = true;
 
-  // 3. Run pure-C++ detection + fitting + tracking pipeline in leveled base_footprint
+  // 3. 在整平后的 base_footprint 下运行纯 C++ 识块、拟合与多目标跟踪流水线
   DetectorPipeline::CloudPtr debug_roi;
   DetectorPipeline::CloudPtr debug_nonground;
   if (debug_publish_clouds_) {
@@ -1152,7 +1149,7 @@ void MidtoboxDetectorNode::processSensorCloud(
     prev_T_odom_base_ = T_odom_base;
   }
 
-  // 4. Transform outputs into requested output_frame and publish
+  // 4. 将检测与跟踪结果变换到用户指定的 output_frame 并发布全部 ROS 2 话题
   Eigen::Isometry3d T_out_base = Eigen::Isometry3d::Identity();
   std::string active_out_frame = base_frame_;
   lookupBaseToOutput(stamp, has_odom, T_odom_base, T_out_base, active_out_frame);
@@ -1170,12 +1167,12 @@ void MidtoboxDetectorNode::publishResults(
 {
   const Eigen::Quaterniond q_out_base(T_out_base.linear());
 
-  // 1. /midtobox/locked
+  // 1. 发布锁定状态话题（topics.locked）
   std_msgs::msg::Bool locked_msg;
   locked_msg.data = res.locked;
   locked_pub_->publish(locked_msg);
 
-  // 2. /midtobox/target_pose (only when a confirmed primary target exists)
+  // 2. 发布主目标位姿话题（topics.target_pose，仅在存在确认主目标时发布）
   if (res.has_primary) {
     geometry_msgs::msg::PoseStamped pose_msg;
     pose_msg.header.stamp = stamp;
@@ -1186,7 +1183,7 @@ void MidtoboxDetectorNode::publishResults(
     target_pose_pub_->publish(pose_msg);
   }
 
-  // 3. /midtobox/detections (ALL confirmed valid cubes simultaneously)
+  // 3. 发布所有有效确认方块数组（topics.detections）
   vision_msgs::msg::Detection3DArray det_array;
   det_array.header.stamp = stamp;
   det_array.header.frame_id = out_frame;
@@ -1216,7 +1213,7 @@ void MidtoboxDetectorNode::publishResults(
   }
   detections_pub_->publish(det_array);
 
-  // 4. /midtobox/markers (DELETEALL + valid tracks + oversized/rejected cluster debug markers + ROI)
+  // 4. 发布 RViz 可视化标记（先 DELETEALL 清屏，再画有效方块、质心球、朝向箭头、文本、拒判红框与 ROI）
   visualization_msgs::msg::MarkerArray marker_array;
   {
     visualization_msgs::msg::Marker clear_m;
@@ -1231,7 +1228,7 @@ void MidtoboxDetectorNode::publishResults(
     const Eigen::Vector3d pos_out = T_out_base * trk.center;
     const Eigen::Quaterniond q_out = (q_out_base * trk.orientation).normalized();
 
-    // Cube body
+    // 有效方块半透明实体框（主目标锁定=绿，主目标未锁=青，其余确认块=蓝）
     visualization_msgs::msg::Marker cube;
     cube.header.stamp = stamp;
     cube.header.frame_id = out_frame;
@@ -1252,7 +1249,7 @@ void MidtoboxDetectorNode::publishResults(
     }
     marker_array.markers.push_back(cube);
 
-    // Centroid sphere
+    // 3D 质心黄色圆球标记
     visualization_msgs::msg::Marker sphere;
     sphere.header = cube.header;
     sphere.ns = "centroids";
@@ -1266,7 +1263,7 @@ void MidtoboxDetectorNode::publishResults(
     sphere.color.r = 1.0f; sphere.color.g = 0.95f; sphere.color.b = 0.1f; sphere.color.a = 0.95f;
     marker_array.markers.push_back(sphere);
 
-    // Heading arrow
+    // 块体朝向箭头标记
     visualization_msgs::msg::Marker arrow;
     arrow.header = cube.header;
     arrow.ns = "headings";
@@ -1280,7 +1277,7 @@ void MidtoboxDetectorNode::publishResults(
     arrow.color.r = 1.0f; arrow.color.g = 0.8f; arrow.color.b = 0.0f; arrow.color.a = 0.95f;
     marker_array.markers.push_back(arrow);
 
-    // Info text label (offset upward in base_footprint so it sits above cube in any output frame)
+    // 文本标签：在 base_footprint 中沿真实上方 +Z 偏移后再变换到输出系，确保倒装坐标系下仍在方块上方
     const Eigen::Vector3d label_pos_out =
       T_out_base * (trk.center + Eigen::Vector3d(0.0, 0.0, 0.5 * trk.size.z() + 0.12));
     visualization_msgs::msg::Marker text;
@@ -1308,7 +1305,7 @@ void MidtoboxDetectorNode::publishResults(
     marker_array.markers.push_back(text);
   }
 
-  // Oversized touching/stacked clusters flagged visibly in red/orange
+  // 超大粘连/堆叠拒判簇用红橙色高亮标出，方便排查误粘连
   if (debug_publish_rejected_markers_) {
     for (const auto & rej : res.rejected_clusters) {
       if (!rej.is_oversized) {
@@ -1380,7 +1377,7 @@ void MidtoboxDetectorNode::publishResults(
 
   markers_pub_->publish(marker_array);
 
-  // 5. Optional debug point clouds (always in base_footprint for direct geometry inspection)
+  // 5. 可选调试点云（始终在 base_footprint 下发布，方便直观对照裁剪与去地效果）
   if (debug_publish_clouds_) {
     if (debug_accum_pub_ && roi_cloud) {
       sensor_msgs::msg::PointCloud2 msg;

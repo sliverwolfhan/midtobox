@@ -1,8 +1,8 @@
 // Copyright 2026 midtobox contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Pure C++ (PCL + Eigen) perception pipeline implementation.
-// Euclidean cluster extraction adapted from SS47816/lidar_obstacle_detector (MIT).
+// 纯 C++（PCL + Eigen）方块质心感知流水线实现。
+// 欧氏聚类流程借鉴自 SS47816/lidar_obstacle_detector (MIT License)。
 
 #include "midtobox_detector/detector_pipeline.hpp"
 
@@ -49,7 +49,7 @@ PipelineResult DetectorPipeline::process(
   }
   result.input_points = static_cast<int>(base_cloud->size());
 
-  // 1. Ego-vehicle 3D exclusion CropBox + Workspace ROI crop (in leveled base_footprint)
+  // 1. 自车 3D 包围盒剔除 + 作业区 ROI 裁剪（均在整平后的 base_footprint 下执行）
   CloudPtr roi_cloud(new CloudT);
   roi_cloud->points.reserve(base_cloud->size());
   const auto & cc = config_.crop;
@@ -76,6 +76,7 @@ PipelineResult DetectorPipeline::process(
   roi_cloud->height = 1;
   roi_cloud->is_dense = true;
 
+  // 可选体素降采样（默认关闭以保持方块边缘精度）
   if (cc.voxel_leaf_size > 1e-4 && !roi_cloud->empty()) {
     CloudPtr down(new CloudT);
     pcl::VoxelGrid<PointT> vg;
@@ -91,11 +92,11 @@ PipelineResult DetectorPipeline::process(
     *roi_cloud_out = *roi_cloud;
   }
 
-  // 2. Tilt-constrained RANSAC ground segmentation
+  // 2. 倾角约束 RANSAC 地面分割
   CloudPtr raw_non_ground(new CloudT);
   result.ground_plane = ground_segmenter_.segment(roi_cloud, config_.ground, raw_non_ground);
 
-  // 3. RadiusOutlierRemoval before clustering to strip edge-dragging "veil" bridges
+  // 3. 聚类前先执行 ROR 半径离群滤波，打断 Mid-360 边缘“拉丝”飞点形成的块间桥接
   CloudPtr filtered_non_ground =
     ground_segmenter_.applyRadiusOutlierRemoval(raw_non_ground, config_.outlier);
   result.non_ground_points = static_cast<int>(filtered_non_ground->size());
@@ -104,14 +105,16 @@ PipelineResult DetectorPipeline::process(
     *non_ground_cloud_out = *filtered_non_ground;
   }
 
+  // 判断目标是否为正方形（90° 四折对称）还是长方形（180° 二折对称）
   const bool is_square = std::abs(config_.fitting.length - config_.fitting.width) < 0.02;
   const double sym_period = is_square ? kHalfPi : kPi;
 
   if (static_cast<int>(filtered_non_ground->size()) >= config_.cluster.min_size) {
-    // 4. Transform non-ground points into ground-leveled frame G (z = height above ground)
+    // 4. 将非地面点云变换到地面整平系 G（z_G 表示真实离地高度，z_G = 0 为地面）
     const Eigen::Matrix3d R_level =
       config_.ground.level_to_ground ? result.ground_plane.levelRotation()
                                      : Eigen::Matrix3d::Identity();
+    // 关闭旋转整平时，若 RANSAC 拟合成功仍保留垂直高度偏移 d/c，避免地面标高偏差误杀高度门控
     const double d_shift = config_.ground.level_to_ground
       ? result.ground_plane.d
       : ((result.ground_plane.from_ransac && result.ground_plane.c > 1e-6)
@@ -143,7 +146,7 @@ PipelineResult DetectorPipeline::process(
     leveled_cloud->height = 1;
     leveled_cloud->is_dense = true;
 
-    // 5. PCL KD-tree Euclidean Cluster Extraction
+    // 5. PCL KD-Tree 欧氏聚类，分离间距 >= 10 cm 的多个独立方块
     pcl::search::KdTree<PointT>::Ptr tree(new pcl::search::KdTree<PointT>);
     tree->setInputCloud(leveled_cloud);
 
@@ -156,7 +159,7 @@ PipelineResult DetectorPipeline::process(
     ec.setInputCloud(leveled_cloud);
     ec.extract(cluster_indices);
 
-    // 6. Per-cluster SOR, size gating (explicit oversized rejection), and known-size box fitting
+    // 6. 逐簇处理：SOR 修剪边缘飞点 -> 尺寸/高度门控（显式拦截超大粘连/堆叠）-> 已知尺寸几何拟合
     for (const auto & indices : cluster_indices) {
       CloudPtr cluster_cloud(new CloudT);
       cluster_cloud->points.reserve(indices.indices.size());
@@ -187,12 +190,14 @@ PipelineResult DetectorPipeline::process(
         continue;
       }
 
+      // 计算簇的鲁棒 2D OBB 跨度与 p03/p97 高度范围，用于尺寸门控
       const Obb2D obb = BoxFitter::computeRobustObb2D(pts_2d);
       const double z_p97 = BoxFitter::computeQuantile(z_vals, 0.97);
       const double z_p03 = BoxFitter::computeQuantile(z_vals, 0.03);
       const Eigen::Vector3d cluster_center_base =
         fromGround(Eigen::Vector3d(obb.center.x(), obb.center.y(), 0.5 * z_p97));
 
+      // 超大簇拦截：水平超限（并排粘连）或高度超限（上下堆叠）直接拒判并标记供 RViz 标红
       const bool oversized_xy =
         (obb.major_span > config_.gate.max_xy_span) ||
         (obb.minor_span > config_.gate.max_xy_span);
@@ -219,7 +224,7 @@ PipelineResult DetectorPipeline::process(
         continue;
       }
 
-      // Minimum size & ground-contact gate
+      // 最小尺寸、点数与落地校验（剔除过小杂物和悬空干扰物）
       if (static_cast<int>(pts_3d.size()) < config_.gate.min_points ||
           obb.major_span < config_.gate.min_xy_span ||
           z_p97 < config_.gate.min_z ||
@@ -245,7 +250,7 @@ PipelineResult DetectorPipeline::process(
         continue;
       }
 
-      // Known-size box fitting in ground-leveled frame G
+      // 在地面整平系 G 下执行已知尺寸方块几何拟合
       BoxDetection det_ground;
       std::string reject_reason;
       if (!BoxFitter::fitBoxInGroundFrame(
@@ -260,6 +265,7 @@ PipelineResult DetectorPipeline::process(
           std::max(z_p97, 0.05));
         rej.yaw = obb.yaw;
         rej.point_count = static_cast<int>(pts_3d.size());
+        // 仅当顶面纵深超长或高度高于目标块时才标记为超大拒判（矮箱不误标超大）
         rej.is_oversized =
           (reject_reason == "top_depth_oversized") ||
           (reject_reason == "height_mismatch" && z_p97 > config_.fitting.height);
@@ -268,7 +274,7 @@ PipelineResult DetectorPipeline::process(
         continue;
       }
 
-      // Transform fitted detection from ground-leveled frame G back to base_footprint
+      // 将 G 系拟合结果变换回 base_footprint，并保留真实地面坡度倾角
       BoxDetection det_base = det_ground;
       det_base.center = fromGround(det_ground.center);
 
@@ -277,7 +283,7 @@ PipelineResult DetectorPipeline::process(
       const double yaw_base =
         canonicalizeSymmetricYaw(std::atan2(x_axis_base.y(), x_axis_base.x()), sym_period);
 
-      // Align ground-frame yaw rotation to the exact symmetry branch of yaw_base
+      // 将 G 系偏航角对齐到与 yaw_base 一致的对称分支，再左乘地面逆旋转得到 3D 姿态
       const double sym_shift =
         std::round((yaw_base - det_ground.yaw) / sym_period) * sym_period;
       const double yaw_g_aligned = det_ground.yaw + sym_shift;
@@ -291,7 +297,7 @@ PipelineResult DetectorPipeline::process(
     }
   }
 
-  // 7. Multi-object tracking (Hungarian + 6D KF + unwrapped yaw + lock & primary selection)
+  // 7. 多目标跟踪更新（匈牙利匹配 + 6D 卡尔曼滤波 + 连续 yaw 展开 + 主目标滞回与锁定门控）
   tracker_.update(
     result.raw_detections,
     stamp_sec,

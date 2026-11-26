@@ -1,8 +1,8 @@
 // Copyright 2026 midtobox contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Tilt-constrained RANSAC ground segmentation and outlier removal (ROR/SOR).
-// Adapted from SS47816/lidar_obstacle_detector (MIT License).
+// 倾角约束 RANSAC 地面分割与边缘拉丝离群滤波（ROR / SOR）实现。
+// 地面分割思路参考 SS47816/lidar_obstacle_detector (MIT License)。
 
 #include "midtobox_detector/ground_segmenter.hpp"
 
@@ -39,7 +39,7 @@ PlaneModel GroundSegmenter::segment(
   }
 
   if (cfg.use_ransac) {
-    // 1. Pre-select candidate ground points in leveled Z-band
+    // 1. 先截取整平坐标系下接近地面的 Z 带点云作为候选地面点，加速 RANSAC 并防止拟合到墙面/顶面
     CloudPtr band_cloud(new CloudT);
     band_cloud->points.reserve(roi_cloud->size());
     for (const auto & pt : roi_cloud->points) {
@@ -54,6 +54,7 @@ PlaneModel GroundSegmenter::segment(
     band_cloud->is_dense = true;
 
     if (static_cast<int>(band_cloud->size()) >= std::max(cfg.min_inliers, 3)) {
+      // 使用垂直于 +Z 轴且带最大倾角约束的 RANSAC 拟合地面平面
       pcl::SACSegmentation<PointT> seg;
       seg.setOptimizeCoefficients(true);
       seg.setModelType(pcl::SACMODEL_PERPENDICULAR_PLANE);
@@ -78,6 +79,7 @@ PlaneModel GroundSegmenter::segment(
         double d = coeffs->values[3];
         const double norm = std::sqrt(a * a + b * b + c * c);
         if (norm > 1e-9) {
+          // 归一化平面系数，并强制法向量朝上 (c > 0)
           a /= norm;
           b /= norm;
           c /= norm;
@@ -90,7 +92,7 @@ PlaneModel GroundSegmenter::segment(
           }
           const double clamped_c = std::clamp(c, -1.0, 1.0);
           const double tilt_rad = std::acos(clamped_c);
-          // Ground z at origin (x=0, y=0): z0 = -d / c
+          // 校验原点 (x=0, y=0) 处地面高度 z0 = -d / c 是否落在允许偏差范围内
           const double z_origin = (c > 1e-6) ? (-d / c) : 1e9;
           if (tilt_rad <= max_tilt_rad + 1e-3 &&
               std::abs(z_origin - cfg.nominal_z) <= cfg.max_plane_offset)
@@ -107,7 +109,7 @@ PlaneModel GroundSegmenter::segment(
     }
   }
 
-  // 2. Separate non-ground points using exact signed distance above plane
+  // 2. 按点到拟合地面的精确有符号高度分离非地面目标点（h >= clearance_height）
   non_ground_out->points.reserve(roi_cloud->size());
   for (const auto & pt : roi_cloud->points) {
     const double h = plane.a * pt.x + plane.b * pt.y + plane.c * pt.z + plane.d;

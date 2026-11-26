@@ -1,10 +1,9 @@
 // Copyright 2026 midtobox contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Multi-object box tracker: Hungarian optimal assignment + 6D constant-velocity
-// Kalman filter + 4-fold symmetric temporal yaw unwrapping + lock quality gating
-// + nearest-target primary selector with hysteresis.
-// Tracking architecture adapted from SS47816/lidar_obstacle_detector (MIT License).
+// 多目标方块跟踪实现：匈牙利最优匹配 + 6D 常速卡尔曼滤波 + 4 折对称偏航角连续展开
+// + 锁定质量/抖动门控 + 带滞回防抖的最近主目标选择。
+// 跟踪架构参考 SS47816/lidar_obstacle_detector (MIT License)。
 
 #include "midtobox_detector/tracker.hpp"
 
@@ -31,11 +30,11 @@ std::vector<std::pair<size_t, size_t>> solveHungarianAssignment(
     return matches;
   }
 
-  // Pad to square matrix of size N = max(n_rows, n_cols) using a large dummy cost
+  // 补齐为 N x N 方阵（无效/超距项填充大代价值），以支持矩形代价矩阵求解
   const size_t N = std::max(n_rows, n_cols);
   const double kLargeCost = std::max(max_cost * 100.0, 1e6);
 
-  // 1-indexed arrays for classic Jonker/Kuhn-Munkres potential formulation (O(N^3))
+  // 经典 1-indexed Jonker / Kuhn-Munkres 势能法实现，时间复杂度 O(N^3)
   std::vector<std::vector<double>> a(N + 1, std::vector<double>(N + 1, kLargeCost));
   for (size_t i = 0; i < n_rows; ++i) {
     for (size_t j = 0; j < n_cols; ++j) {
@@ -116,7 +115,7 @@ void BoxTracker::reset()
 
 void BoxTracker::predictTrack(TrackState & trk, double dt, const TrackerConfig & cfg) const
 {
-  // Constant-velocity transition with mild velocity damping to prevent overshoot on static targets
+  // 常速运动转移矩阵（带轻微速度阻尼，抑制静止方块因残余速度引起的位置过冲）
   Eigen::Matrix<double, 6, 6> F = Eigen::Matrix<double, 6, 6>::Identity();
   F(0, 3) = dt;
   F(1, 4) = dt;
@@ -158,16 +157,16 @@ void BoxTracker::updateTrack(
 
   trk.x = trk.x + K * y;
   const Eigen::Matrix<double, 6, 6> I = Eigen::Matrix<double, 6, 6>::Identity();
-  // Joseph form for numerical stability
+  // 采用 Joseph 形式更新协方差，确保数值对称正定
   const Eigen::Matrix<double, 6, 6> IKH = I - K * H;
   trk.P = IKH * trk.P * IKH.transpose() + K * R * K.transpose();
 
-  // Temporally unwrapped yaw update (prevents +/-45 deg boundary jumps on square cubes)
+  // 帧间连续展开偏航角并做 EMA 平滑，彻底防止正方形在 ±45° 边界处发生 90° 跳变
   const double yaw_diff = shortestSymmetricAngleDiff(det.yaw, trk.yaw, sym_period);
   const double meas_yaw_unwrapped = trk.yaw + yaw_diff;
   trk.yaw = trk.yaw + std::clamp(cfg.yaw_alpha, 0.05, 1.0) * yaw_diff;
 
-  // Extract pure tilt (ground slope component) by factoring out yaw from measurement quaternion
+  // 从观测姿态中分离出纯地面坡度倾斜分量（剔除绕 Z 轴偏航）
   const Eigen::Quaterniond q_yaw_det(Eigen::AngleAxisd(det.yaw, Eigen::Vector3d::UnitZ()));
   trk.latest_tilt = (det.orientation * q_yaw_det.inverse()).normalized();
 
@@ -182,7 +181,7 @@ void BoxTracker::updateTrack(
   trk.hits += 1;
   trk.missed = 0;
 
-  // Push matched measurements (unwrapped yaw) into lock stability history
+  // 将当前帧匹配观测（连续展开后的 yaw）压入锁定抖动滑窗历史
   const size_t max_hist = static_cast<size_t>(std::max(cfg.lock_window_frames, 2));
   trk.pos_history.push_back(det.center);
   trk.yaw_history.push_back(meas_yaw_unwrapped);
@@ -299,7 +298,7 @@ void BoxTracker::update(
   if (has_last_stamp_) {
     const double raw_dt = stamp_sec - last_stamp_sec_;
     if (raw_dt < -0.5 || raw_dt > 2.0) {
-      // Timestamp jump (e.g. bag loop or stream pause) -> reset stale tracks
+      // 时间戳大幅跳变（如 rosbag 循环回放或数据流中断）-> 清空旧轨迹重新跟踪
       reset();
       did_reset = true;
       dt = 0.1;
@@ -310,17 +309,17 @@ void BoxTracker::update(
   has_last_stamp_ = true;
   last_stamp_sec_ = stamp_sec;
 
-  // 0. Compensate existing track states for robot ego-motion when odom TF is active
+  // 0. 当 odom TF 有效时，先将历史轨迹状态补偿到当前帧 base_footprint 消除自车运动滞后
   if (!did_reset && T_curr_prev != nullptr) {
     applyEgoMotion(*T_curr_prev);
   }
 
-  // 1. Predict all existing tracks
+  // 1. 对所有现有轨迹执行卡尔曼预测
   for (auto & trk : tracks_) {
     predictTrack(trk, dt, cfg);
   }
 
-  // 2. Build Euclidean cost matrix & solve Hungarian assignment
+  // 2. 构建 3D 欧氏距离代价矩阵并求解匈牙利最优关联
   std::vector<bool> track_matched(tracks_.size(), false);
   std::vector<bool> det_matched(detections.size(), false);
 
@@ -344,7 +343,7 @@ void BoxTracker::update(
     }
   }
 
-  // 3. Age unmatched tracks & prune expired tracks
+  // 3. 对未匹配轨迹递增丢帧计数并清理超时轨迹
   for (size_t i = 0; i < tracks_.size(); ++i) {
     if (!track_matched[i]) {
       tracks_[i].missed += 1;
@@ -356,7 +355,7 @@ void BoxTracker::update(
       [&](const TrackState & trk) { return trk.missed > cfg.max_missed_frames; }),
     tracks_.end());
 
-  // 4. Spawn new tracks for unmatched detections
+  // 4. 为未关联的新检测初始化新轨迹
   for (size_t j = 0; j < detections.size(); ++j) {
     if (det_matched[j]) {
       continue;
@@ -370,7 +369,7 @@ void BoxTracker::update(
     trk.P(3, 3) = 0.25;
     trk.P(4, 4) = 0.25;
     trk.P(5, 5) = 0.10;
-    // Initialize yaw strictly canonical in [-period/2, +period/2)
+    // 初始偏航角严格归约到 [-period/2, +period/2)
     trk.yaw = canonicalizeSymmetricYaw(det.yaw, sym_period);
     const Eigen::Quaterniond q_yaw_det(Eigen::AngleAxisd(det.yaw, Eigen::Vector3d::UnitZ()));
     trk.latest_tilt = (det.orientation * q_yaw_det.inverse()).normalized();
@@ -388,7 +387,7 @@ void BoxTracker::update(
     tracks_.push_back(std::move(trk));
   }
 
-  // 5. Build output track list (confirmed tracks only) & select primary target with hysteresis
+  // 5. 生成已确认目标输出列表，并基于最近距离 + 滞回防抖策略选出主目标
   tracks_out.clear();
   tracks_out.reserve(tracks_.size());
 
@@ -424,7 +423,7 @@ void BoxTracker::update(
     const int cur_idx = static_cast<int>(tracks_out.size());
     tracks_out.push_back(out);
 
-    // Eligible for primary selection if currently observed or at most 1 missed frame
+    // 仅允许当前观测到或最多丢失 1 帧的目标参与主目标竞争
     if (out.missed <= 1) {
       const double dist_xy = std::hypot(out.center.x(), out.center.y());
       if (out.track_id == primary_track_id_) {
@@ -446,7 +445,7 @@ void BoxTracker::update(
       const double prev_dist = std::hypot(
         tracks_out[prev_primary_idx].center.x(),
         tracks_out[prev_primary_idx].center.y());
-      // Keep previous primary unless another confirmed track is closer by at least hysteresis
+      // 保持原主目标，除非新目标比原主目标至少近 switch_hysteresis_m 才切换
       if (nearest_dist + cfg.switch_hysteresis_m >= prev_dist) {
         chosen_idx = prev_primary_idx;
       }
